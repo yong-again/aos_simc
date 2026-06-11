@@ -241,26 +241,45 @@ def parse_warscrolls(html: str, faction_slug: str) -> list[dict]:
     return warscrolls
 
 
-def fetch_faction_warscrolls(faction_slug: str, force: bool = False) -> list[dict]:
-    """Fetch + parse one faction, with a JSON file cache in app/data."""
-    if faction_slug not in FACTIONS:
-        raise ValueError(f"Unknown faction slug: {faction_slug}")
-    cache_file = DATA_DIR / f"{faction_slug}.json"
-    if cache_file.exists() and not force:
-        return json.loads(cache_file.read_text(encoding="utf-8"))
-
-    resp = requests.get(
-        BASE_URL.format(slug=faction_slug),
-        headers={"User-Agent": USER_AGENT},
-        timeout=60,
-    )
-    resp.raise_for_status()
-    warscrolls = parse_warscrolls(resp.text, faction_slug)
-
+def _write_cache(cache_file: Path, warscrolls: list[dict]) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     cache_file.write_text(
         json.dumps(warscrolls, ensure_ascii=False, indent=1), encoding="utf-8"
     )
+
+
+def fetch_faction_warscrolls(
+    faction_slug: str, force: bool = False, structure: bool = True
+) -> list[dict]:
+    """Fetch + parse one faction, with a JSON file cache in app/data.
+
+    After HTML parsing, ability text is converted into machine-readable
+    ``structured`` parameters via Gemini (see services.ability_parser)
+    and the enriched result is what gets cached. Cached files from
+    before this feature are upgraded in place on the next call.
+    """
+    if faction_slug not in FACTIONS:
+        raise ValueError(f"Unknown faction slug: {faction_slug}")
+    cache_file = DATA_DIR / f"{faction_slug}.json"
+
+    if cache_file.exists() and not force:
+        warscrolls = json.loads(cache_file.read_text(encoding="utf-8"))
+    else:
+        resp = requests.get(
+            BASE_URL.format(slug=faction_slug),
+            headers={"User-Agent": USER_AGENT},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        warscrolls = parse_warscrolls(resp.text, faction_slug)
+        _write_cache(cache_file, warscrolls)
+
+    if structure:
+        # local import: the scraper stays usable without the genai package
+        from ..services.ability_parser import structure_warscroll_abilities
+
+        if structure_warscroll_abilities(warscrolls):
+            _write_cache(cache_file, warscrolls)
     return warscrolls
 
 
