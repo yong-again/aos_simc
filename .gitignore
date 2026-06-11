@@ -17,3 +17,6 @@ frontend/dist/
 # IDE
 .idea/
 .vscode/
+
+# claude worktrees
+.claude/worktrees/
