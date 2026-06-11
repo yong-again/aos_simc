@@ -180,7 +180,7 @@ function drawEffect(ctx, fx, age, pos) {
       const len = inToPx(1.1) * (0.6 + age * 0.6);
       ctx.save();
       ctx.globalAlpha = fade;
-      ctx.strokeStyle = '#ff8a5c';
+      ctx.strokeStyle = fx.color || '#ff8a5c';
       ctx.lineWidth = 3;
       ctx.beginPath();
       ctx.moveTo(cx - len, cy - len);

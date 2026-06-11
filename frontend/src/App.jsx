@@ -214,6 +214,12 @@ export default function App() {
           const fx = [];
           if (ev.kind === 'shoot') {
             fx.push({ kind: 'tracer', fromUid: ev.uid, toUid: ev.target, ttl: 650 });
+          } else if (ev.kind === 'mortal') {
+            // mortal wounds: purple arcane slash, no save possible
+            fx.push({
+              kind: 'slash', toUid: ev.target, color: '#c084fc',
+              at: { x: target.x, y: target.y }, ttl: 600,
+            });
           } else {
             fx.push({ kind: 'slash', toUid: ev.target, at: { x: target.x, y: target.y }, ttl: 500 });
           }
