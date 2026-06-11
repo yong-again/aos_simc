@@ -19,6 +19,7 @@ import re
 from dataclasses import dataclass, field
 
 from .combat import expected_damage, roll_value, unit_attack
+from .effects import apply_turn_mortal_wounds, collect_mods, effective_ward
 
 BOARD_W = 60.0  # inches
 BOARD_H = 44.0
@@ -49,6 +50,7 @@ class SimUnit:
     base_h: float = 1.0  # base depth in inches (per model)
     ranged: list = field(default_factory=list)
     melee: list = field(default_factory=list)
+    abilities_raw: list = field(default_factory=list)
 
     @property
     def total_health(self) -> int:
@@ -119,6 +121,7 @@ def build_sim_units(merged_roster: dict, side: str) -> list[SimUnit]:
                 base_h=base_h,
                 ranged=ws.get("ranged_weapons", []),
                 melee=ws.get("melee_weapons", []),
+                abilities_raw=ws.get("abilities", []),
             )
         )
 
@@ -190,8 +193,10 @@ class BattleSimulator:
             dist = u.distance(target)
             if dist <= COMBAT_RANGE:
                 continue  # already in combat; hold
+            move_mod = collect_mods(u, self.units, "movement").get("move", 0)
+            eff_move = max(0.0, u.move + move_mod)
             # stop just outside combat range so the charge phase decides
-            step = min(u.move, max(dist - (COMBAT_RANGE - 0.5), 0))
+            step = min(eff_move, max(dist - (COMBAT_RANGE - 0.5), 0))
             # don't walk into melee if we'd rather shoot from range
             if u.ranged and not u.melee:
                 shoot_rng = max(_num(w.get("range", "")) for w in u.ranged)
@@ -234,7 +239,11 @@ class BattleSimulator:
                 key=lambda e: expected_damage(usable, u.models_alive, e.save),
             )
             weapons = [w for w in usable if u.distance(target) <= _num(w.get("range", ""))]
-            dmg = unit_attack(weapons, u.models_alive, target.save, self.rng, target.ward)
+            atk_mods = collect_mods(u, self.units, "shooting")
+            def_mods = collect_mods(target, self.units, "shooting")
+            ward = effective_ward(target, def_mods)
+            dmg = unit_attack(weapons, u.models_alive, target.save, self.rng,
+                              ward, atk_mods, def_mods)
             self.apply_damage(u, target, dmg, "shoots", "shoot")
 
     def charge_phase(self, side: str):
@@ -282,7 +291,11 @@ class BattleSimulator:
                 targets,
                 key=lambda e: expected_damage(u.melee, u.models_alive, e.save),
             )
-            dmg = unit_attack(u.melee, u.models_alive, target.save, self.rng, target.ward)
+            atk_mods = collect_mods(u, self.units, "combat")
+            def_mods = collect_mods(target, self.units, "combat")
+            ward = effective_ward(target, def_mods)
+            dmg = unit_attack(u.melee, u.models_alive, target.save, self.rng,
+                              ward, atk_mods, def_mods)
             self.apply_damage(u, target, dmg, "hits", "melee")
 
     def apply_damage(self, attacker: SimUnit, target: SimUnit, dmg: int, verb: str, kind: str):
@@ -316,6 +329,7 @@ class BattleSimulator:
                 if not self.side_units("player") or not self.side_units("enemy"):
                     break
                 self.emit(type="turn", side=side)
+                apply_turn_mortal_wounds(self, side)
                 self.movement_phase(side)
                 self.shooting_phase(side)
                 self.charge_phase(side)

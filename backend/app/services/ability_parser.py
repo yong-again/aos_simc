@@ -96,6 +96,14 @@ def _structure_batch(items: list[dict]) -> dict[str, list[dict]]:
     return {w.warscroll_id: [a.model_dump() for a in w.abilities] for w in parsed}
 
 
+def _norm_id(s: str) -> str:
+    """IDs can contain non-breaking spaces, which LLMs echo back mangled
+    (observed: \\xa0 returned as \\x00). Collapse all control/space chars."""
+    import re
+
+    return re.sub(r"[\x00-\x20\xa0]+", " ", s).strip()
+
+
 def structure_warscroll_abilities(warscrolls: list[dict]) -> bool:
     """Attach a ``structured`` object to every ability of every warscroll
     that doesn't have one yet (merge — original text is kept for the UI).
@@ -129,8 +137,9 @@ def structure_warscroll_abilities(warscrolls: list[dict]) -> bool:
             print(f"[ability_parser] batch failed ({e}); skipping {len(batch)} warscrolls")
             time.sleep(GEMINI_DELAY_S)
             continue
+        results_norm = {_norm_id(k): v for k, v in results.items()}
         for ws in batch:
-            structured = results.get(ws["id"])
+            structured = results.get(ws["id"]) or results_norm.get(_norm_id(ws["id"]))
             if not structured:
                 continue
             for i, ability in enumerate(ws["abilities"]):

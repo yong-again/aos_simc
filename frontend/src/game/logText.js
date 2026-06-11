@@ -17,7 +17,15 @@ export function formatEvent(ev, names, lang) {
     case 'charge_failed':
       return `[돌격] ${n(ev.uid)} 돌격 실패 (2D6=${ev.roll})`;
     case 'attack': {
-      const label = ev.kind === 'shoot' ? '사격' : '근접';
+      const label =
+        ev.kind === 'shoot' ? '사격' : ev.kind === 'mortal' ? '모탈' : '근접';
+      if (ev.kind === 'mortal') {
+        return (
+          `[모탈] ${n(ev.uid)} → ${n(ev.target)}: 모탈 운드 ${ev.damage}` +
+          (ev.ability ? ` (${ev.ability})` : '') +
+          (ev.slain ? ` — ${n(ev.target)} 파괴!` : '')
+        );
+      }
       if (!ev.damage) return `[${label}] ${n(ev.uid)} → ${n(ev.target)}: 피해 없음`;
       return (
         `[${label}] ${n(ev.uid)} → ${n(ev.target)}: 피해 ${ev.damage}` +

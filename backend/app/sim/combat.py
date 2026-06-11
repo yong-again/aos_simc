@@ -65,8 +65,24 @@ def rend_value(stat: str) -> int:
     return int(m.group()) if m else 0
 
 
-def roll_attacks(weapon: dict, models: int, rng: random.Random) -> int:
-    """Total damage from one unit's attacks with one weapon profile."""
+def _roll_passes(rng: random.Random, base_target: int, delta: int) -> bool:
+    """One D6 roll against a modified target number. Unmodified 1 always
+    fails and 6 always succeeds (core rules)."""
+    roll = rng.randint(1, 6)
+    if roll == 1:
+        return False
+    if roll == 6:
+        return True
+    return roll >= base_target + delta
+
+
+def roll_attacks(
+    weapon: dict, models: int, rng: random.Random, mods: dict | None = None
+) -> int:
+    """Wounding hits from one unit's attacks with one weapon profile.
+    ``mods`` carries structured-ability deltas ('hit'/'wound', already
+    capped at +/-1; negative improves the roll)."""
+    mods = mods or {}
     hit_t = target_number(weapon["hit"])
     wound_t = target_number(weapon["wound"])
     if hit_t is None or wound_t is None:
@@ -76,11 +92,11 @@ def roll_attacks(weapon: dict, models: int, rng: random.Random) -> int:
     crit_two_hits = any("2 Hits" in a for a in weapon.get("abilities", []))
     for _ in range(attacks):
         roll = rng.randint(1, 6)
-        if roll < hit_t:
+        if roll == 1 or (roll != 6 and roll < hit_t + mods.get("hit", 0)):
             continue
         hits = 2 if (roll == 6 and crit_two_hits) else 1
         for _ in range(hits):
-            if rng.randint(1, 6) >= wound_t:
+            if _roll_passes(rng, wound_t, mods.get("wound", 0)):
                 total += 1
     return total  # number of wounding hits; saves applied by caller
 
@@ -91,18 +107,27 @@ def resolve_damage(
     save_stat: str,
     rng: random.Random,
     ward_stat: str = "",
+    atk_mods: dict | None = None,
+    def_mods: dict | None = None,
 ) -> int:
-    """Apply save rolls (modified by Rend), roll damage, then ward rolls."""
+    """Apply save rolls (modified by Rend), roll damage, then ward rolls.
+
+    ``atk_mods`` may add 'rend'/'damage'; ``def_mods`` may shift 'save'
+    (negative improves the save, same convention as roll targets)."""
+    atk_mods = atk_mods or {}
+    def_mods = def_mods or {}
     save_t = target_number(save_stat)
     ward_t = target_number(ward_stat)
-    rend = rend_value(weapon["rend"])
+    rend = max(0, rend_value(weapon["rend"]) + atk_mods.get("rend", 0))
+    dmg_bonus = atk_mods.get("damage", 0)
     damage = 0
     for _ in range(wounding_hits):
         if save_t is not None:
-            needed = save_t + rend
+            needed = save_t + rend + def_mods.get("save", 0)
             if needed <= 6 and rng.randint(1, 6) >= needed:
                 continue  # saved
-        for _ in range(roll_value(weapon["damage"], rng) or 1):
+        per_hit = max(1, (roll_value(weapon["damage"], rng) or 1) + dmg_bonus)
+        for _ in range(per_hit):
             if ward_t is not None and rng.randint(1, 6) >= ward_t:
                 continue  # warded
             damage += 1
@@ -115,12 +140,16 @@ def unit_attack(
     defender_save: str,
     rng: random.Random,
     defender_ward: str = "",
+    atk_mods: dict | None = None,
+    def_mods: dict | None = None,
 ) -> int:
     """Full attack sequence for all of a unit's weapon profiles."""
     total = 0
     for weapon in attacker_weapons:
-        wounds = roll_attacks(weapon, models, rng)
-        total += resolve_damage(wounds, weapon, defender_save, rng, defender_ward)
+        wounds = roll_attacks(weapon, models, rng, atk_mods)
+        total += resolve_damage(
+            wounds, weapon, defender_save, rng, defender_ward, atk_mods, def_mods
+        )
     return total
 
 
