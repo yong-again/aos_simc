@@ -19,7 +19,13 @@ import re
 from dataclasses import dataclass, field
 
 from .combat import expected_damage, roll_value, unit_attack
-from .effects import apply_turn_mortal_wounds, collect_mods, effective_ward
+from .effects import (
+    apply_turn_mortal_wounds,
+    collect_mods,
+    collect_mods_detailed,
+    describe_effect,
+    effective_ward,
+)
 
 BOARD_W = 60.0  # inches
 BOARD_H = 44.0
@@ -153,6 +159,7 @@ class BattleSimulator:
         self.events: list[dict] = []
         self.log: list[str] = []
         self.round = 0
+        self._last_effects: dict[str, tuple] = {}
 
     # -- helpers -------------------------------------------------------
     def side_units(self, side: str, alive_only: bool = True):
@@ -193,7 +200,10 @@ class BattleSimulator:
             dist = u.distance(target)
             if dist <= COMBAT_RANGE:
                 continue  # already in combat; hold
-            move_mod = collect_mods(u, self.units, "movement").get("move", 0)
+            move_mods, move_details = collect_mods_detailed(u, self.units, "movement")
+            move_mod = move_mods.get("move", 0)
+            if move_mod:
+                self.emit_effects(u, [d for d in move_details if d["stat"] == "move"], "mover")
             eff_move = max(0.0, u.move + move_mod)
             # stop just outside combat range so the charge phase decides
             step = min(eff_move, max(dist - (COMBAT_RANGE - 0.5), 0))
@@ -239,8 +249,10 @@ class BattleSimulator:
                 key=lambda e: expected_damage(usable, u.models_alive, e.save),
             )
             weapons = [w for w in usable if u.distance(target) <= _num(w.get("range", ""))]
-            atk_mods = collect_mods(u, self.units, "shooting")
-            def_mods = collect_mods(target, self.units, "shooting")
+            atk_mods, atk_details = collect_mods_detailed(u, self.units, "shooting")
+            def_mods, def_details = collect_mods_detailed(target, self.units, "shooting")
+            self.emit_effects(u, atk_details, "attacker")
+            self.emit_effects(target, def_details, "defender")
             ward = effective_ward(target, def_mods)
             dmg = unit_attack(weapons, u.models_alive, target.save, self.rng,
                               ward, atk_mods, def_mods)
@@ -291,12 +303,32 @@ class BattleSimulator:
                 targets,
                 key=lambda e: expected_damage(u.melee, u.models_alive, e.save),
             )
-            atk_mods = collect_mods(u, self.units, "combat")
-            def_mods = collect_mods(target, self.units, "combat")
+            atk_mods, atk_details = collect_mods_detailed(u, self.units, "combat")
+            def_mods, def_details = collect_mods_detailed(target, self.units, "combat")
+            self.emit_effects(u, atk_details, "attacker")
+            self.emit_effects(target, def_details, "defender")
             ward = effective_ward(target, def_mods)
             dmg = unit_attack(u.melee, u.models_alive, target.save, self.rng,
                               ward, atk_mods, def_mods)
             self.apply_damage(u, target, dmg, "hits", "melee")
+
+    def emit_effects(self, unit: SimUnit, details: list, role: str):
+        """Logs which abilities are affecting ``unit`` and who cast them.
+        Repeats are suppressed until the unit's effect set changes."""
+        if not details:
+            return
+        key = tuple(sorted(
+            (d["source_uid"], d["ability"], d["stat"], d["amount"], d["mode"])
+            for d in details
+        ))
+        if self._last_effects.get(unit.uid) == key:
+            return
+        self._last_effects[unit.uid] = key
+        summary = "; ".join(describe_effect(d) for d in details)
+        self.emit(
+            type="effects", uid=unit.uid, role=role, effects=details,
+            text=f"{unit.name} is affected by: {summary}",
+        )
 
     def apply_damage(self, attacker: SimUnit, target: SimUnit, dmg: int, verb: str, kind: str):
         if dmg <= 0:
