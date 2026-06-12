@@ -69,14 +69,44 @@ export function formatEvent(ev, names, lang) {
   switch (ev.type) {
     case 'deploy':
       return '양군 배치 완료';
-    case 'round':
-      return `${ev.round_no}라운드 시작 — 선공: ${ev.first === 'player' ? '아군' : '적'}`;
+    case 'round': {
+      const ud = ev.underdog
+        ? ` (언더독 ${ev.underdog === 'player' ? '아군' : '적'} +1 CP)`
+        : '';
+      return `${ev.round_no}라운드 시작 — 선공: ${ev.first === 'player' ? '아군' : '적'}${ud}`;
+    }
     case 'phase': {
       const side = ev.side === 'player' ? '아군' : '적';
       return `=== [R${ev.round}] ${side} ${PHASE_KO[ev.phase] || ev.phase} ===`;
     }
     case 'move':
       return `[이동] ${n(ev.uid)} → ${n(ev.target)} 방향으로 ${ev.dist}" 이동`;
+    case 'retreat':
+      return (
+        `[후퇴] ${n(ev.uid)} 전투 이탈 — 모탈 피해 ${ev.damage}` +
+        (ev.slain ? ` — ${n(ev.uid)} 파괴!` : '')
+      );
+    case 'cast':
+      if (!ev.success && ev.roll < ev.needed) {
+        return `[마법] ${n(ev.uid)} 아케인 볼트 시전 실패 (2D6=${ev.roll}, 필요 ${ev.needed}+)`;
+      }
+      return (
+        `[마법] ${n(ev.uid)} → ${n(ev.target)}: 아케인 볼트 시전 (2D6=${ev.roll})` +
+        (ev.success ? '' : ' — 언바인드됨')
+      );
+    case 'miscast':
+      return (
+        `[미스캐스트 발생!] ${n(ev.uid)} 주사위 1이 2개 (${ev.dice.join(',')}) — ` +
+        `모탈 피해 ${ev.damage}, 이번 페이즈 시전 불가` +
+        (ev.slain ? ` — ${n(ev.uid)} 파괴!` : '')
+      );
+    case 'unbind':
+      return (
+        `[언바인드] ${n(ev.uid)} 시전 방해 시도 (2D6=${ev.roll} vs ${ev.against}) — ` +
+        (ev.success ? '성공!' : '실패')
+      );
+    case 'cp_reset':
+      return `${ev.round_no}라운드 종료 — 미사용 CP 소멸`;
     case 'charge':
       return `[돌격] ${n(ev.uid)} → ${n(ev.target)} 돌격 성공! (2D6=${ev.roll})`;
     case 'charge_failed':
@@ -99,7 +129,8 @@ export function formatEvent(ev, names, lang) {
         'Counter-charge': '역돌격',
       };
       const DETAIL_KO = {
-        'Rally': () => `피해 ${ev.healed} 회복`,
+        'Rally': () =>
+          `${ev.revived ? `모델 ${ev.revived}기 부활, ` : ''}총 ${ev.healed} 회복`,
         'All-out Attack': () => '명중 +1',
         'All-out Defence': () => '방어 +1',
         'Forward to Victory': () => '돌격 재굴림',
@@ -114,7 +145,10 @@ export function formatEvent(ev, names, lang) {
       return `${ev.side === 'player' ? '아군' : '적'} 턴 종료 — 남은 CP ${ev.cp}`;
     case 'attack': {
       const label =
-        ev.kind === 'shoot' ? '사격' : ev.kind === 'mortal' ? '모탈' : '근접';
+        ev.kind === 'shoot' ? '사격'
+        : ev.kind === 'mortal' ? '모탈'
+        : ev.kind === 'spell' ? '마법'
+        : '근접';
       const applied = appliedSuffixKo(ev.applied);
       if (ev.kind === 'mortal') {
         return (
