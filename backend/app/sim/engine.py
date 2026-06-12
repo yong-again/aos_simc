@@ -19,6 +19,13 @@ import re
 from dataclasses import dataclass, field
 
 from .combat import expected_damage, roll_value, unit_attack, ward_roll
+from .terrain import (
+    Terrain,
+    adjust_move_for_terrain,
+    can_see,
+    cover_applies,
+    generate_battlefield_terrain,
+)
 from .effects import (
     apply_turn_mortal_wounds,
     collect_mods,
@@ -58,6 +65,9 @@ class SimUnit:
     melee: list = field(default_factory=list)
     abilities_raw: list = field(default_factory=list)
     keywords: list = field(default_factory=list)
+    charged_this_turn: bool = False
+    summoner_uid: str = ""   # manifestations: removed when summoner dies
+    ritual_points: int = 0   # priests: accumulated chanting points
 
     @property
     def wizard_level(self) -> int:
@@ -67,6 +77,23 @@ class SimUnit:
             if m:
                 return int(m.group(1))
         return 0
+
+    @property
+    def priest_level(self) -> int:
+        """X from 'PRIEST ( X )': chants/banishments per phase."""
+        for k in self.keywords:
+            m = re.match(r"PRIEST\s*\(\s*(\d+)\s*\)", k)
+            if m:
+                return int(m.group(1))
+        return 0
+
+    @property
+    def is_manifestation(self) -> bool:
+        return "MANIFESTATION" in self.keywords
+
+    @property
+    def is_faction_terrain(self) -> bool:
+        return "FACTION TERRAIN" in self.keywords
 
     @property
     def has_musician(self) -> bool:
@@ -192,6 +219,12 @@ class BattleSimulator:
         # Rules of One bookkeeping, reset at every phase marker:
         self._unit_commands: set[str] = set()   # uids that used a command
         self._army_commands = {"player": set(), "enemy": set()}  # command names
+        self.terrains: list[Terrain] = []
+        self.manifestation_pool = {"player": [], "enemy": []}  # warscrolls
+        self._pop_buffs: dict[str, str] = {}     # uid -> "plus1" | "wizard1"
+        self._summoned_this_turn: set[str] = set()
+        self._removed_this_turn: set[str] = set()
+        self._prayer_used: set[str] = set()      # prayer names used (army-wide/turn)
 
     # -- helpers -------------------------------------------------------
     def side_units(self, side: str, alive_only: bool = True):
@@ -217,6 +250,7 @@ class BattleSimulator:
         resets the Rules-of-One command limits (per unit / per army)."""
         self._unit_commands.clear()
         self._army_commands = {"player": set(), "enemy": set()}
+        self.check_summoner_deaths()
         label = phase.replace("_", " ").title()
         self.emit(
             type="phase", category="PHASE", side=side, phase=phase,
@@ -438,6 +472,7 @@ class BattleSimulator:
                     to=[round(nx, 2), round(ny, 2)],
                 )
                 u.x, u.y = nx, ny
+                u.charged_this_turn = True
             else:
                 self.emit(
                     type="charge_failed", category="CHARGE", uid=u.uid, roll=roll,
@@ -445,12 +480,60 @@ class BattleSimulator:
                 )
             return  # one Counter-charge per reaction window
 
+    def place_of_power_rolls(self):
+        """Start of any turn: every HERO within 3" of a Place of Power
+        rolls a D6. 1: D3 mortal damage. 2+: WIZARD/PRIEST gain +1 to
+        casting/chanting (not unbinding) this turn; other heroes count
+        as WIZARD (1) for the turn (may unbind/banish)."""
+        pops = [t for t in self.terrains if "Place of Power" in t.traits]
+        if not pops:
+            return
+        for u in self.units:
+            if not u.alive or not u.is_hero:
+                continue
+            if not any(t.distance_to(u.x, u.y) <= 3.0 for t in pops):
+                continue
+            roll = self.rng.randint(1, 6)
+            if roll == 1:
+                pool = self.rng.randint(1, 3)
+                dmg, warded = ward_roll(pool, u.ward, self.rng)
+                if warded:
+                    self.emit_defense(u, u.ward, warded, dmg)
+                u.wounds_taken += dmg
+                slain = not u.alive
+                self.emit(
+                    type="terrain_power", category="EFFECT", uid=u.uid,
+                    roll=roll, damage=dmg, slain=slain,
+                    text=f"{u.name} is scorched by the Place of Power "
+                    f"(rolled 1): {dmg} mortal damage"
+                    + (f" — {u.name} is destroyed!" if slain else ""),
+                )
+            else:
+                if u.wizard_level > 0 or u.priest_level > 0:
+                    self._pop_buffs[u.uid] = "plus1"
+                    detail = "+1 to casting/chanting rolls this turn"
+                else:
+                    self._pop_buffs[u.uid] = "wizard1"
+                    detail = "counts as WIZARD (1) this turn (may unbind/banish)"
+                self.emit(
+                    type="terrain_power", category="EFFECT", uid=u.uid,
+                    roll=roll, buff=self._pop_buffs[u.uid],
+                    text=f"{u.name} channels the Place of Power "
+                    f"(rolled {roll}): {detail}",
+                )
+
+    def effective_wizard_level(self, u: SimUnit) -> int:
+        if u.wizard_level > 0:
+            return u.wizard_level
+        return 1 if self._pop_buffs.get(u.uid) == "wizard1" else 0
+
     # -- phases --------------------------------------------------------
     def hero_phase(self, side: str):
         """Hero phase: start-of-turn abilities, Rally and casting."""
         self.phase_marker(side, "hero")
         apply_turn_mortal_wounds(self, side)
         self._rally(side)
+        self.prayer_actions(side)
         self.magic_actions(side)
 
     def _rally(self, side: str):
@@ -496,6 +579,174 @@ class BattleSimulator:
             healed=total_restored, revived=revived,
         )
 
+    # -- prayers (AoS4 chanting) ----------------------------------------
+    GENERIC_PRAYER = ("Divine Smite", 4)  # (name, chanting value)
+
+    def prayer_actions(self, side: str):
+        """PRIEST (X) units make X chanting/banishment attempts. Chanting
+        roll is 1D6: an unmodified 1 fails and burns D3 ritual points;
+        otherwise the AI either accumulates the roll as ritual points or
+        invokes when roll + points meet the chanting value. A prayer
+        without UNLIMITED may only be attempted by one unit per army
+        per turn."""
+        prayer_name, value = self.GENERIC_PRAYER
+        for priest in [u for u in self.side_units(side) if u.priest_level > 0]:
+            attempts = priest.priest_level
+            while attempts > 0 and priest.alive:
+                attempts -= 1
+                # banishment takes priority if an enemy manifestation lurks
+                if self._try_banish(priest, side):
+                    continue
+                if prayer_name in self._prayer_used:
+                    break  # non-UNLIMITED: one attempting unit per army
+                roll = self.rng.randint(1, 6)
+                if roll == 1:
+                    lost = min(priest.ritual_points, self.rng.randint(1, 3))
+                    priest.ritual_points -= lost
+                    self.emit(
+                        type="chant", category="PRAYER", uid=priest.uid,
+                        roll=1, success=False, lost=lost,
+                        points=priest.ritual_points,
+                        text=f"{priest.name}'s chant falters (rolled 1) — "
+                        f"loses {lost} ritual point(s) "
+                        f"({priest.ritual_points} left)",
+                    )
+                    continue
+                bonus = 1 if self._pop_buffs.get(priest.uid) == "plus1" else 0
+                eff = roll + bonus
+                if eff + priest.ritual_points >= value:
+                    # invoke: spend everything, prayer resolves
+                    self._prayer_used.add(prayer_name)
+                    spent = priest.ritual_points
+                    priest.ritual_points = 0
+                    self.emit(
+                        type="chant", category="PRAYER", uid=priest.uid,
+                        roll=roll, bonus=bonus, spent=spent, success=True,
+                        prayer=prayer_name, points=0,
+                        text=f"{priest.name} invokes '{prayer_name}' "
+                        f"(rolled {roll}{f'+{bonus}' if bonus else ''}"
+                        f"{f' + {spent} ritual points' if spent else ''})",
+                    )
+                    targets = [
+                        e for e in self.enemies_of(priest)
+                        if priest.distance(e) <= 12.0
+                    ]
+                    if targets:
+                        target = min(targets, key=priest.distance)
+                        pool = self.rng.randint(1, 3)
+                        ward = effective_ward(
+                            target, collect_mods(target, self.units, None)
+                        )
+                        dmg, warded = ward_roll(pool, ward, self.rng)
+                        self.apply_damage(priest, target, dmg, "smites", "spell",
+                                          warded=warded, ward=ward)
+                else:
+                    priest.ritual_points += roll  # accumulate the bare roll
+                    self.emit(
+                        type="chant", category="PRAYER", uid=priest.uid,
+                        roll=roll, success=False, accumulated=True,
+                        points=priest.ritual_points,
+                        text=f"{priest.name} accumulates ritual points "
+                        f"(rolled {roll}, total {priest.ritual_points}/{value})",
+                    )
+
+    # -- manifestations ---------------------------------------------------
+    BANISH_VALUE = 7
+
+    def _enemy_manifestations(self, side: str):
+        return [
+            u for u in self.units
+            if u.alive and u.side != side and u.is_manifestation
+        ]
+
+    def _try_banish(self, u: SimUnit, side: str) -> bool:
+        """Banish Manifestation: 2D6 + (total enemy manifestations - 1)
+        vs the Banishment Value, against a manifestation within 30"."""
+        targets = [
+            m for m in self._enemy_manifestations(side)
+            if u.distance(m) <= 30.0
+        ]
+        if not targets:
+            return False
+        target = min(targets, key=u.distance)
+        bonus = max(0, len(self._enemy_manifestations(side)) - 1)
+        roll = self.rng.randint(1, 6) + self.rng.randint(1, 6)
+        success = roll + bonus >= self.BANISH_VALUE
+        self.emit(
+            type="banish", category="MAGIC", uid=u.uid, target=target.uid,
+            roll=roll, bonus=bonus, needed=self.BANISH_VALUE, success=success,
+            text=f"{u.name} attempts to banish {target.name} "
+            f"(2D6={roll}{f'+{bonus}' if bonus else ''} vs "
+            f"{self.BANISH_VALUE}) — "
+            + ("banished!" if success else "it persists"),
+        )
+        if success:
+            self.remove_manifestation(target, "banished")
+        return True
+
+    def remove_manifestation(self, m: SimUnit, reason: str):
+        m.wounds_taken = m.models * m.health_per_model
+        self._removed_this_turn.add(m.name)
+        self.emit(
+            type="manifestation_removed", category="MAGIC", uid=m.uid,
+            reason=reason,
+            text=f"{m.name} is removed from the battlefield ({reason})",
+        )
+
+    def check_summoner_deaths(self):
+        """A manifestation is removed the moment its summoner is slain."""
+        alive_uids = {u.uid for u in self.units if u.alive}
+        for m in self.units:
+            if m.alive and m.is_manifestation and m.summoner_uid:
+                if m.summoner_uid not in alive_uids:
+                    self.remove_manifestation(m, "its summoner was slain")
+
+    def try_summon_manifestation(self, caster: SimUnit, side: str) -> bool:
+        """Endless spells are summoned through the casting sequence
+        (CV 6). The same manifestation can't be attempted twice per turn
+        nor resummoned in the turn it was removed."""
+        pool = self.manifestation_pool.get(side) or []
+        active = {u.name for u in self.units if u.alive and u.is_manifestation}
+        ws = next(
+            (w for w in pool
+             if w["name"] not in active
+             and w["name"] not in self._summoned_this_turn
+             and w["name"] not in self._removed_this_turn),
+            None,
+        )
+        if ws is None:
+            return False
+        self._summoned_this_turn.add(ws["name"])
+        d1, d2 = self.rng.randint(1, 6), self.rng.randint(1, 6)
+        total = d1 + d2 + (1 if self._pop_buffs.get(caster.uid) == "plus1" else 0)
+        CV = 6
+        if (d1 == 1) + (d2 == 1) >= 2 or total < CV:
+            self.emit(
+                type="summon", category="MAGIC", uid=caster.uid,
+                manifestation=ws["name"], roll=total, needed=CV, success=False,
+                text=f"{caster.name} fails to summon {ws['name']} "
+                f"(rolled {total}, needs {CV}+)",
+            )
+            return True  # the attempt still consumed the action
+        # place it between the caster and the nearest enemy
+        enemies = self.enemies_of(caster)
+        if enemies:
+            e = min(enemies, key=caster.distance)
+            d = caster.distance(e) or 1.0
+            mx = caster.x + (e.x - caster.x) / d * min(6.0, d / 2)
+            my = caster.y + (e.y - caster.y) / d * min(6.0, d / 2)
+        else:
+            mx, my = caster.x + 3, caster.y
+        m = _manifestation_unit(ws, side, mx, my, caster.uid)
+        self.units.append(m)
+        self.emit(
+            type="summon", category="MAGIC", uid=caster.uid, target=m.uid,
+            manifestation=ws["name"], roll=total, needed=CV, success=True,
+            unit=unit_payload(m), at=[round(mx, 2), round(my, 2)],
+            text=f"{caster.name} summons {ws['name']} (rolled {total})",
+        )
+        return True
+
     def magic_actions(self, side: str):
         """Casting in the hero phase. Each WIZARD (X) unit has X actions
         this phase — the active side spends them casting, the defending
@@ -508,15 +759,36 @@ class BattleSimulator:
           them out of casting for the rest of the phase
         - only ONE unbind attempt may be made per spell, army-wide
         """
-        casters = [u for u in self.side_units(side) if u.wizard_level > 0]
+        # per-phase action budget for every wizard on the board (a hero
+        # empowered by a Place of Power counts as WIZARD (1))
+        budget = {
+            u.uid: self.effective_wizard_level(u)
+            for u in self.units if self.effective_wizard_level(u) > 0
+        }
+        casters = [
+            u for u in self.side_units(side) if self.effective_wizard_level(u) > 0
+        ]
         if not casters:
             return
-        # per-phase action budget for every wizard on the board
-        budget = {u.uid: u.wizard_level for u in self.units if u.wizard_level > 0}
         CV = 5  # Arcane Bolt casting value
 
         for caster in casters:
             while caster.alive and budget.get(caster.uid, 0) > 0:
+                # banish enemy manifestations first (any effective wizard)
+                if self._enemy_manifestations(side) and any(
+                    caster.distance(m) <= 30.0
+                    for m in self._enemy_manifestations(side)
+                ):
+                    budget[caster.uid] -= 1
+                    self._try_banish(caster, side)
+                    continue
+                # PoP-empowered plain heroes may only unbind/banish
+                if caster.wizard_level == 0:
+                    break
+                # try to bring an endless spell onto the field first
+                if self.try_summon_manifestation(caster, side):
+                    budget[caster.uid] -= 1
+                    continue
                 targets = [
                     e for e in self.enemies_of(caster)
                     if caster.distance(e) <= 12.0
@@ -526,7 +798,9 @@ class BattleSimulator:
                 target = min(targets, key=caster.distance)
                 budget[caster.uid] -= 1
                 d1, d2 = self.rng.randint(1, 6), self.rng.randint(1, 6)
-                total = d1 + d2
+                total = d1 + d2 + (
+                    1 if self._pop_buffs.get(caster.uid) == "plus1" else 0
+                )
 
                 if (d1 == 1) + (d2 == 1) >= 2:
                     # miscast: instant fail, D3 mortal, no more casting
@@ -556,9 +830,12 @@ class BattleSimulator:
                     continue
 
                 # unbind window: at most ONE attempt per spell, army-wide
+                # unbinding is only possible against a SUCCESSFUL cast
+                # (total >= CV reached this branch); one attempt per spell
                 unbinders = [
                     e for e in self.enemies_of(caster)
-                    if e.wizard_level > 0 and budget.get(e.uid, 0) > 0
+                    if self.effective_wizard_level(e) > 0
+                    and budget.get(e.uid, 0) > 0
                     and caster.distance(e) <= 30.0
                 ]
                 unbound = False
@@ -664,6 +941,18 @@ class BattleSimulator:
             ny = u.y + (target.y - u.y) / dist * step
             nx = min(max(nx, 0.5), BOARD_W - 0.5)
             ny = min(max(ny, 0.5), BOARD_H - 0.5)
+            nx, ny, step, t_notes = adjust_move_for_terrain(
+                u, nx, ny, step, self.terrains
+            )
+            if t_notes:
+                self.emit(
+                    type="terrain_move", category="MOVE", uid=u.uid,
+                    notes=t_notes,
+                    text=f"{u.name}'s move is affected by terrain: "
+                    + ", ".join(t_notes),
+                )
+            if step <= 0:
+                continue
             self.emit(
                 type="move", category="MOVE", uid=u.uid, target=target.uid,
                 dist=round(step, 1),
@@ -693,11 +982,27 @@ class BattleSimulator:
             if not usable:
                 continue
             max_range = max(_num(w.get("range", "")) for w in usable)
-            targets = [e for e in self.enemies_of(u) if u.distance(e) <= max_range]
+            targets = []
+            for e in self.enemies_of(u):
+                if u.distance(e) > max_range:
+                    continue
+                visible, blocker = can_see(u, e, self.terrains)
+                if not visible:
+                    self.emit(
+                        type="visibility", category="EFFECT", uid=u.uid,
+                        target=e.uid, terrain=blocker,
+                        text=f"{u.name} cannot see {e.name} "
+                        f"(obscured by {blocker})",
+                    )
+                    continue
+                targets.append(e)
             if not targets:
                 continue
+            # prefer real units over faction terrain / manifestations
+            real = [e for e in targets if not (e.is_faction_terrain or e.is_manifestation)]
+            pool_t = real or targets
             target = max(
-                targets,
+                pool_t,
                 key=lambda e: expected_damage(usable, u.models_alive, e.save),
             )
             weapons = [w for w in usable if u.distance(target) <= _num(w.get("range", ""))]
@@ -707,6 +1012,15 @@ class BattleSimulator:
             self.emit_effects(target, def_details, "defender")
             self.try_all_out_attack(side, u, atk_mods, "SHOOT")
             self.try_all_out_defence(target, def_mods, "SHOOT")
+            cover = cover_applies(u, target, self.terrains)
+            if cover:
+                atk_mods["hit"] = min(1, atk_mods.get("hit", 0) + 1)
+                self.emit(
+                    type="cover", category="EFFECT", uid=target.uid,
+                    attacker=u.uid, terrain=cover,
+                    text=f"{target.name} is in cover behind {cover}: "
+                    f"-1 to hit",
+                )
             ward = effective_ward(target, def_mods)
             dmg, warded = unit_attack(weapons, u.models_alive, target.save, self.rng,
                                       ward, atk_mods, def_mods)
@@ -732,7 +1046,13 @@ class BattleSimulator:
                 continue
             charge_roll = self.rng.randint(1, 6) + self.rng.randint(1, 6)
             if charge_roll >= dist - COMBAT_RANGE + 0.5:
-                travel = dist - 1.0
+                # faction terrain and immobile manifestations may be
+                # charged to within 0.5" (core rules exception)
+                stop = 0.5 if (
+                    target.is_faction_terrain
+                    or (target.is_manifestation and target.move <= 0)
+                ) else 1.0
+                travel = dist - stop
                 nx = u.x + (target.x - u.x) / dist * travel
                 ny = u.y + (target.y - u.y) / dist * travel
                 self.emit(
@@ -741,6 +1061,7 @@ class BattleSimulator:
                     text=f"{u.name} charges {target.name} (rolled {charge_roll})",
                 )
                 u.x, u.y = nx, ny
+                u.charged_this_turn = True
             else:
                 self.emit(
                     type="charge_failed", category="CHARGE", uid=u.uid, roll=charge_roll,
@@ -763,6 +1084,7 @@ class BattleSimulator:
                             text=f"{u.name} charges {target.name} on the re-roll! ({reroll})",
                         )
                         u.x, u.y = nx, ny
+                        u.charged_this_turn = True
 
     def combat_phase(self, side: str):
         self.phase_marker(side, "combat")
@@ -787,8 +1109,9 @@ class BattleSimulator:
             targets = [e for e in self.enemies_of(u) if u.distance(e) <= COMBAT_RANGE]
             if not targets:
                 continue
+            real = [e for e in targets if not (e.is_faction_terrain or e.is_manifestation)]
             target = max(
-                targets,
+                real or targets,
                 key=lambda e: expected_damage(u.melee, u.models_alive, e.save),
             )
             atk_mods, atk_details = collect_mods_detailed(u, self.units, "combat")
@@ -865,6 +1188,8 @@ class BattleSimulator:
             return
         target.wounds_taken += dmg
         slain = not target.alive
+        if slain:
+            self.check_summoner_deaths()
         self.emit(
             type="attack", category=category, kind=kind,
             uid=attacker.uid, target=target.uid, damage=dmg, applied=applied,
@@ -899,6 +1224,13 @@ class BattleSimulator:
                 if not self.side_units("player") or not self.side_units("enemy"):
                     break
                 self.emit(type="turn", category="PHASE", side=side)
+                for u in self.units:
+                    u.charged_this_turn = False
+                self._pop_buffs.clear()
+                self._summoned_this_turn.clear()
+                self._removed_this_turn.clear()
+                self._prayer_used.clear()
+                self.place_of_power_rolls()
                 self.hero_phase(side)
                 self.movement_phase(side)
                 self.shooting_phase(side)
@@ -949,6 +1281,96 @@ class BattleSimulator:
         }
 
 
+def _manifestation_unit(ws: dict, side: str, x: float, y: float,
+                        summoner_uid: str) -> SimUnit:
+    """SimUnit for a summoned endless spell / invocation."""
+    keywords = ws.get("keywords", [])
+    base_w, base_h = _base_size_in(ws.get("base_size", ""))
+    return SimUnit(
+        uid=f"{side}-manif-{re.sub(r'[^A-Za-z0-9]+', '-', ws['name'])}",
+        name=ws["name"], side=side, x=x, y=y,
+        move=_num(ws.get("move", ""), 0.0),
+        save=ws.get("save", ""), ward=ws.get("ward", ""),
+        control=0, models=1,
+        health_per_model=int(_num(ws.get("health", ""), 5) or 5),
+        points=0, faction=ws.get("faction", ""),
+        base_w=base_w, base_h=base_h,
+        ranged=ws.get("ranged_weapons", []),
+        melee=ws.get("melee_weapons", []),
+        abilities_raw=ws.get("abilities", []),
+        keywords=keywords if "MANIFESTATION" in keywords
+        else keywords + ["MANIFESTATION"],
+        summoner_uid=summoner_uid,
+    )
+
+
+def _faction_warscrolls(slug: str) -> list[dict]:
+    """Cached faction warscrolls; empty when the cache is unavailable."""
+    if not slug:
+        return []
+    try:
+        from ..scraper.wahapedia import fetch_faction_warscrolls
+        return fetch_faction_warscrolls(slug, structure=False)
+    except Exception:
+        return []
+
+
+def build_environment(player_roster: dict, enemy_roster: dict):
+    """Deterministic battlefield environment shared by /api/setup and
+    /api/simulate: neutral terrain (seeded by the army identities),
+    each side's faction terrain (as a targetable unit + footprint) and
+    the manifestation pool available to each side's wizards."""
+    ident = "|".join([
+        str(player_roster.get("army_name", "")),
+        str(player_roster.get("faction_slug", "")),
+        str(enemy_roster.get("army_name", "")),
+        str(enemy_roster.get("faction_slug", "")),
+    ])
+    t_rng = random.Random(ident)
+    terrains = generate_battlefield_terrain(t_rng, BOARD_W, BOARD_H)
+
+    terrain_units: list[SimUnit] = []
+    pools: dict[str, list[dict]] = {"player": [], "enemy": []}
+    for side, roster in (("player", player_roster), ("enemy", enemy_roster)):
+        slug = roster.get("faction_slug", "")
+        warscrolls = _faction_warscrolls(slug)
+        pools[side] = [
+            w for w in warscrolls if "MANIFESTATION" in w.get("keywords", [])
+        ][:3]
+        ft_name = (roster.get("faction_terrain") or "").strip()
+        if not ft_name:
+            continue
+        ws = next(
+            (w for w in warscrolls
+             if "FACTION TERRAIN" in w.get("keywords", [])
+             and ft_name.lower() in w["name"].lower()),
+            None,
+        ) or {"name": ft_name, "keywords": ["FACTION TERRAIN"]}
+        keywords = ws.get("keywords", [])
+        x = BOARD_W / 2 + (8 if side == "player" else -8)
+        y = BOARD_H - 8.0 if side == "player" else 8.0
+        base_w, base_h = _base_size_in(ws.get("base_size", ""))
+        unit = SimUnit(
+            uid=f"{side}-fterrain-{re.sub(r'[^A-Za-z0-9]+', '-', ws['name'])}",
+            name=ws["name"], side=side, x=x, y=y,
+            move=0.0, save=ws.get("save", ""), ward=ws.get("ward", ""),
+            control=0, models=1,
+            health_per_model=int(_num(ws.get("health", ""), 8) or 8),
+            points=0, faction=roster.get("faction", ""),
+            base_w=max(base_w, 2.0), base_h=max(base_h, 2.0),
+            abilities_raw=ws.get("abilities", []),
+            keywords=keywords if "FACTION TERRAIN" in keywords
+            else keywords + ["FACTION TERRAIN"],
+        )
+        terrain_units.append(unit)
+        terrains.append(Terrain(
+            tid=f"fterrain-{side}", name=ws["name"], x=x, y=y,
+            radius=max(base_w, 2.0), height=2.0,
+            traits={"Cover"}, is_faction=True, side=side, unit_uid=unit.uid,
+        ))
+    return terrains, terrain_units, pools
+
+
 def simulate(
     player_roster: dict,
     enemy_roster: dict,
@@ -961,6 +1383,9 @@ def simulate(
     enemy_units = build_sim_units(enemy_roster, "enemy")
     auto_deploy(player_units, "player")
     auto_deploy(enemy_units, "enemy")
+    terrains, terrain_units, pools = build_environment(player_roster, enemy_roster)
+    for tu in terrain_units:
+        (player_units if tu.side == "player" else enemy_units).append(tu)
     if deployment:
         pos = {d["uid"]: d for d in deployment}
         for u in player_units:
@@ -968,7 +1393,10 @@ def simulate(
                 u.x = float(pos[u.uid]["x"])
                 u.y = float(pos[u.uid]["y"])
     sim = BattleSimulator(player_units, enemy_units, seed=seed)
+    sim.terrains = terrains
+    sim.manifestation_pool = pools
     result = sim.run()
+    result["terrain"] = [t.payload() for t in terrains]
     result["units"] = [unit_payload(u) for u in sim.units]
     return result
 

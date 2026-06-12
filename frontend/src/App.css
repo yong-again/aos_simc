@@ -131,6 +131,7 @@ button.big { width: 100%; padding: 12px; font-size: 15px; margin-top: 12px; }
 .log-DEFENSE { color: #6db3f2; }
 .log-EFFECT { color: #c084fc; }
 .log-MAGIC { color: #9d7bff; }
+.log-PRAYER { color: #e8c468; }
 .log-SYSTEM { color: var(--text); font-weight: 600; }
 
 /* unit panel */

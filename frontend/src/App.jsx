@@ -47,6 +47,7 @@ export default function App() {
 
   // battle stage
   const [units, setUnits] = useState([]);
+  const [terrain, setTerrain] = useState([]);
   const [selected, setSelected] = useState(null);
   const [result, setResult] = useState(null);
   const [mode, setMode] = useState('A');
@@ -113,6 +114,7 @@ export default function App() {
   const toDeployment = () =>
     guard('setup', async () => {
       const setup = await setupBattle(playerRoster, enemyRoster);
+      setTerrain(setup.terrain || []);
       setUnits(
         setup.units.map((u) => ({
           ...u,
@@ -212,6 +214,39 @@ export default function App() {
             return s ? { ...u, ...s } : u;
           })
         );
+        break;
+      case 'summon':
+        if (ev.success && ev.unit) {
+          setUnits((us) => [
+            ...us,
+            {
+              ...ev.unit,
+              maxHealth: ev.unit.models * ev.unit.health_per_model,
+              health: ev.unit.models * ev.unit.health_per_model,
+              alive: true,
+            },
+          ]);
+        }
+        break;
+      case 'manifestation_removed':
+        setUnits((current) => {
+          const m = current.find((u) => u.uid === ev.uid);
+          if (m) pushEffects([{ kind: 'death', at: { x: m.x, y: m.y }, ttl: 800 }]);
+          return current.map((u) =>
+            u.uid === ev.uid ? { ...u, alive: false, health: 0 } : u
+          );
+        });
+        break;
+      case 'terrain_power':
+        if (ev.damage > 0) {
+          setUnits((us) =>
+            us.map((u) =>
+              u.uid === ev.uid
+                ? { ...u, health: Math.max(0, u.health - ev.damage), alive: !ev.slain }
+                : u
+            )
+          );
+        }
         break;
       case 'miscast':
         if (ev.damage > 0) {
@@ -469,6 +504,7 @@ export default function App() {
             )}
             <BattlefieldCanvas
               units={units}
+              terrain={terrain}
               factionColors={factionColors}
               deploying={stage === 'deploy'}
               onMoveUnit={moveUnit}

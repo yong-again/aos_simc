@@ -21,6 +21,7 @@ from .sim.engine import (
     BOARD_H,
     BOARD_W,
     auto_deploy,
+    build_environment,
     build_sim_units,
     simulate,
     unit_payload,
@@ -129,8 +130,13 @@ def setup_battle(body: SetupRequest):
         side_units = build_sim_units(roster, side)
         auto_deploy(side_units, side)
         units.extend(unit_payload(u) for u in side_units)
+    terrains, terrain_units, _ = build_environment(
+        body.player_roster, body.enemy_roster
+    )
+    units.extend(unit_payload(u) for u in terrain_units)
     return {"board": {"width": BOARD_W, "height": BOARD_H, "zone_depth": 12},
-            "units": units}
+            "units": units,
+            "terrain": [t.payload() for t in terrains]}
 
 
 @app.post("/api/simulate")

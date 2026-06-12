@@ -66,6 +66,52 @@ function drawBoard(ctx, deploying) {
   }
 }
 
+// terrain pieces: color/style by trait
+function drawTerrain(ctx, t) {
+  const px = inToPx(t.x);
+  const py = inToPx(t.y);
+  const r = inToPx(t.radius);
+  ctx.save();
+  let fill = 'rgba(110, 140, 90, 0.35)'; // default: cover woods
+  let stroke = '#7da267';
+  if (t.traits.includes('Impassable')) {
+    fill = 'rgba(120, 120, 125, 0.55)';
+    stroke = '#9a9aa0';
+  } else if (t.traits.includes('Place of Power')) {
+    fill = 'rgba(212, 175, 55, 0.30)';
+    stroke = '#d4af37';
+  } else if (t.traits.includes('Unstable')) {
+    fill = 'rgba(150, 110, 70, 0.35)';
+    stroke = '#a98456';
+    ctx.setLineDash([5, 4]);
+  }
+  if (t.is_faction) {
+    stroke = t.side === 'player' ? '#6db3f2' : '#f28b8b';
+  }
+  ctx.fillStyle = fill;
+  ctx.strokeStyle = stroke;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(px, py, r, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = 'rgba(230, 230, 230, 0.75)';
+  ctx.font = '10px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText(t.name, px, py - r - 4);
+  if (t.traits.includes('Obscuring')) {
+    ctx.font = `${Math.min(r, inToPx(1.4))}px sans-serif`;
+    ctx.textBaseline = 'middle';
+    ctx.fillText('🌲', px, py);
+  } else if (t.traits.includes('Place of Power')) {
+    ctx.font = `${Math.min(r, inToPx(1.4))}px sans-serif`;
+    ctx.textBaseline = 'middle';
+    ctx.fillText('✨', px, py);
+  }
+  ctx.restore();
+}
+
 function drawUnit(ctx, u, pos, colors, selected, now) {
   const px = inToPx(pos.x);
   const py = inToPx(pos.y);
@@ -272,6 +318,7 @@ function drawEffect(ctx, fx, age, pos) {
 
 export default function BattlefieldCanvas({
   units,
+  terrain = [],
   factionColors,
   deploying,
   onMoveUnit,
@@ -284,8 +331,8 @@ export default function BattlefieldCanvas({
   const [hover, setHover] = useState(null);
   const dragRef = useRef(null);
   const displayPosRef = useRef(new Map()); // uid -> eased {x, y}
-  const stateRef = useRef({ units, factionColors, deploying, selectedUid, effects });
-  stateRef.current = { units, factionColors, deploying, selectedUid, effects };
+  const stateRef = useRef({ units, terrain, factionColors, deploying, selectedUid, effects });
+  stateRef.current = { units, terrain, factionColors, deploying, selectedUid, effects };
 
   // continuous render loop: eases unit positions and animates effects
   useEffect(() => {
@@ -293,7 +340,7 @@ export default function BattlefieldCanvas({
     const tick = () => {
       const ctx = canvasRef.current?.getContext('2d');
       if (!ctx) return;
-      const { units, factionColors, deploying, selectedUid, effects } = stateRef.current;
+      const { units, terrain, factionColors, deploying, selectedUid, effects } = stateRef.current;
       const now = performance.now();
       const positions = displayPosRef.current;
 
@@ -310,6 +357,7 @@ export default function BattlefieldCanvas({
       }
 
       drawBoard(ctx, deploying);
+      for (const t of terrain) drawTerrain(ctx, t);
       const pos = (uid) => positions.get(uid);
       // dead units first so live ones draw on top
       for (const u of units)
