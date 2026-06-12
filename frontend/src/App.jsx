@@ -208,6 +208,27 @@ export default function App() {
           return current;
         });
         break;
+      case 'command':
+        // Rally heals: green floating number + health restore
+        if (ev.healed > 0) {
+          setUnits((current) => {
+            const target = current.find((u) => u.uid === ev.uid);
+            if (target) {
+              pushEffects([
+                {
+                  kind: 'damage', at: { x: target.x, y: target.y },
+                  text: `+${ev.healed}`, color: '#6dc36d', ttl: 900,
+                },
+              ]);
+            }
+            return current.map((u) =>
+              u.uid === ev.uid
+                ? { ...u, health: Math.min(u.maxHealth, u.health + ev.healed) }
+                : u
+            );
+          });
+        }
+        break;
       case 'end':
         setPhaseLabel(t('battleOver'));
         break;

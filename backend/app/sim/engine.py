@@ -160,6 +160,7 @@ class BattleSimulator:
         self.log: list[str] = []
         self.round = 0
         self._last_effects: dict[str, tuple] = {}
+        self.cp = {"player": 0, "enemy": 0}  # command points (4/round, AoS4)
 
     # -- helpers -------------------------------------------------------
     def side_units(self, side: str, alive_only: bool = True):
@@ -201,17 +202,78 @@ class BattleSimulator:
             for u in self.units
         ]
 
+    # -- command abilities (AoS4 core) ----------------------------------
+    def spend_cp(self, side: str) -> bool:
+        if self.cp[side] <= 0:
+            return False
+        self.cp[side] -= 1
+        return True
+
+    def emit_command(self, side: str, command: str, unit: SimUnit,
+                     category: str, detail: str, healed: int = 0):
+        self.emit(
+            type="command", category=category, side=side, command=command,
+            uid=unit.uid, cp_left=self.cp[side], healed=healed,
+            text=f"{unit.name} uses '{command}' — {detail} "
+            f"(CP left: {self.cp[side]})",
+        )
+
+    def try_all_out_attack(self, side: str, attacker: SimUnit,
+                           atk_mods: dict, category: str) -> None:
+        """All-out Attack (1 CP): +1 to hit for this unit's attacks."""
+        if atk_mods.get("hit", 0) <= -1:
+            return  # hit roll already at the +1 cap
+        if not self.spend_cp(side):
+            return
+        atk_mods["hit"] = max(-1, atk_mods.get("hit", 0) - 1)
+        self.emit_command(side, "All-out Attack", attacker, category, "+1 to hit")
+
+    def try_all_out_defence(self, defender: SimUnit, def_mods: dict,
+                            category: str) -> None:
+        """All-out Defence (1 CP, reaction): +1 to save for the target.
+        The AI saves it for valuable targets (heroes / 200+ pts)."""
+        side = defender.side
+        if not (defender.is_hero or defender.points >= 200):
+            return
+        if def_mods.get("save", 0) <= -1:
+            return
+        if not self.spend_cp(side):
+            return
+        def_mods["save"] = max(-1, def_mods.get("save", 0) - 1)
+        self.emit_command(side, "All-out Defence", defender, category, "+1 to save")
+
     # -- phases --------------------------------------------------------
     def hero_phase(self, side: str):
-        """Hero phase skeleton: start-of-turn abilities resolve here.
-        Command abilities / heroic actions hook in here later."""
+        """Hero phase: start-of-turn abilities + Rally command."""
         self.phase_marker(side, "hero")
         apply_turn_mortal_wounds(self, side)
+        # Rally (1 CP): most damaged unit not in combat rolls 6 dice,
+        # each 4+ heals 1 damage (AoS4 rally points, simplified)
+        wounded = [
+            u for u in self.side_units(side)
+            if u.wounds_taken > 0
+            and not any(u.distance(e) <= COMBAT_RANGE for e in self.enemies_of(u))
+        ]
+        if wounded and self.cp[side] > 0:
+            target = max(wounded, key=lambda u: u.wounds_taken)
+            self.spend_cp(side)
+            rally_points = sum(1 for _ in range(6) if self.rng.randint(1, 6) >= 4)
+            healed = min(target.wounds_taken, rally_points)
+            target.wounds_taken -= healed
+            self.emit_command(
+                side, "Rally", target, "HERO",
+                f"rolled {rally_points} rally point(s), heals {healed} damage",
+                healed=healed,
+            )
 
     def end_phase(self, side: str):
-        """End phase skeleton: end-of-turn effects (battleshock, expiring
-        buffs) hook in here later."""
+        """End phase: AoS4 has no battleshock — expiring effects resolve
+        here; for now we report the side's remaining command points."""
         self.phase_marker(side, "end")
+        self.emit(
+            type="cp_status", category="PHASE", side=side, cp=self.cp[side],
+            text=f"{side} ends the turn with {self.cp[side]} CP remaining",
+        )
 
     def movement_phase(self, side: str):
         self.phase_marker(side, "movement")
@@ -276,6 +338,8 @@ class BattleSimulator:
             def_mods, def_details = collect_mods_detailed(target, self.units, "shooting")
             self.emit_effects(u, atk_details, "attacker")
             self.emit_effects(target, def_details, "defender")
+            self.try_all_out_attack(side, u, atk_mods, "SHOOT")
+            self.try_all_out_defence(target, def_mods, "SHOOT")
             ward = effective_ward(target, def_mods)
             dmg, warded = unit_attack(weapons, u.models_alive, target.save, self.rng,
                                       ward, atk_mods, def_mods)
@@ -310,6 +374,23 @@ class BattleSimulator:
                     type="charge_failed", category="CHARGE", uid=u.uid, roll=charge_roll,
                     text=f"{u.name} fails its charge (rolled {charge_roll})",
                 )
+                # Forward to Victory (1 CP): re-roll the failed charge
+                if self.spend_cp(side):
+                    reroll = self.rng.randint(1, 6) + self.rng.randint(1, 6)
+                    self.emit_command(side, "Forward to Victory", u, "CHARGE",
+                                      f"re-rolls the charge ({reroll})")
+                    if reroll >= dist - COMBAT_RANGE + 0.5:
+                        travel = dist - 1.0
+                        nx = u.x + (target.x - u.x) / dist * travel
+                        ny = u.y + (target.y - u.y) / dist * travel
+                        self.emit(
+                            type="charge", category="CHARGE", uid=u.uid,
+                            target=target.uid, roll=reroll,
+                            frm=[round(u.x, 2), round(u.y, 2)],
+                            to=[round(nx, 2), round(ny, 2)],
+                            text=f"{u.name} charges {target.name} on the re-roll! ({reroll})",
+                        )
+                        u.x, u.y = nx, ny
 
     def combat_phase(self, side: str):
         self.phase_marker(side, "combat")
@@ -331,6 +412,8 @@ class BattleSimulator:
             def_mods, def_details = collect_mods_detailed(target, self.units, "combat")
             self.emit_effects(u, atk_details, "attacker")
             self.emit_effects(target, def_details, "defender")
+            self.try_all_out_attack(u.side, u, atk_mods, "COMBAT")
+            self.try_all_out_defence(target, def_mods, "COMBAT")
             ward = effective_ward(target, def_mods)
             dmg, warded = unit_attack(u.melee, u.models_alive, target.save, self.rng,
                                       ward, atk_mods, def_mods)
@@ -415,8 +498,10 @@ class BattleSimulator:
             # roll-off for priority each battle round
             first = "player" if self.rng.random() < 0.5 else "enemy"
             second = "enemy" if first == "player" else "player"
+            self.cp = {"player": 4, "enemy": 4}  # AoS4: 4 CP per round
             self.emit(type="round", category="PHASE", round_no=rnd, first=first,
-                      text=f"Battle round {rnd} begins — {first} goes first")
+                      text=f"Battle round {rnd} begins — {first} goes first "
+                      f"(both sides gain 4 CP)")
             for side in (first, second):
                 if not self.side_units("player") or not self.side_units("enemy"):
                     break
