@@ -85,6 +85,25 @@ export function formatEvent(ev, names, lang) {
         `[방어] ${n(ev.uid)}가 'Ward ${ev.ward}' 효과로 피해 ${ev.negated}점 무효화!` +
         ` (최종 피해: ${ev.final_damage})`
       );
+    case 'command': {
+      const CMD_KO = {
+        'Rally': '랠리',
+        'All-out Attack': '총공격',
+        'All-out Defence': '총방어',
+        'Forward to Victory': '승리를 향하여',
+      };
+      const detail =
+        ev.command === 'Rally'
+          ? `피해 ${ev.healed} 회복`
+          : ev.command === 'All-out Attack'
+          ? '명중 +1'
+          : ev.command === 'All-out Defence'
+          ? '방어 +1'
+          : '돌격 재굴림';
+      return `[커맨드] ${n(ev.uid)} — '${CMD_KO[ev.command] || ev.command}' (${detail}, 남은 CP ${ev.cp_left})`;
+    }
+    case 'cp_status':
+      return `${ev.side === 'player' ? '아군' : '적'} 턴 종료 — 남은 CP ${ev.cp}`;
     case 'attack': {
       const label =
         ev.kind === 'shoot' ? '사격' : ev.kind === 'mortal' ? '모탈' : '근접';

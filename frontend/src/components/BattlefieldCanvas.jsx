@@ -199,7 +199,7 @@ function drawEffect(ctx, fx, age, pos) {
       const cy = inToPx(p.y ?? p[1]) - inToPx(1.4) - age * 22;
       ctx.save();
       ctx.globalAlpha = fade;
-      ctx.fillStyle = fx.miss ? '#aab4c0' : '#ffd34d';
+      ctx.fillStyle = fx.color || (fx.miss ? '#aab4c0' : '#ffd34d');
       ctx.font = `bold ${fx.miss ? 12 : 16}px sans-serif`;
       ctx.textAlign = 'center';
       ctx.strokeStyle = 'rgba(0,0,0,0.7)';
