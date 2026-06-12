@@ -55,16 +55,23 @@ def _timing_applies(ability: dict, phase: str | None) -> bool:
     return timing == PHASE_TIMING.get(phase)
 
 
-def collect_mods(unit, all_units, phase: str | None) -> dict[str, int]:
-    """Effective stat deltas for ``unit`` in the given phase.
+def collect_mods_detailed(
+    unit, all_units, phase: str | None
+) -> tuple[dict[str, int], list[dict]]:
+    """Effective stat deltas for ``unit`` plus per-ability attribution.
 
     Aggregates self buffs, friendly auras and enemy debuffs from every
     unconditional structured modifier on the board, then caps roll
     modifiers at +/-1. Sign convention follows the schema: for roll
     stats 'subtract' improves the roll (4+ -> 3+), so the returned
     delta is added to the target number.
+
+    The second return value lists every contribution for the battle log:
+    [{source_uid, source_name, ability, stat, amount, mode}] where mode
+    is 'add' (signed amount) or 'set' (absolute target number).
     """
     totals: dict[str, float] = {}
+    details: list[dict] = []
 
     for src in all_units:
         if not src.alive:
@@ -93,12 +100,48 @@ def collect_mods(unit, all_units, phase: str | None) -> dict[str, int]:
                     continue
                 value = roll_value(mod.get("value", "1"), random.Random(0)) or 1
                 if mod.get("modifier_type") == "set":
+                    raw = mod.get("value", "")
+                    tn = target_number(raw)
+                    if tn is None:
+                        num = roll_value(raw, random.Random(0))
+                        # roll-target stats need a valid 2+..6+ target;
+                        # plain stats (control, move, ...) take any number
+                        if stat in TARGET_ROLL_SET_STATS and 2 <= num <= 6:
+                            tn = num
+                        elif stat not in TARGET_ROLL_SET_STATS and num >= 1:
+                            tn = num
+                        elif any(neg in raw.lower() for neg in ("cannot", "no ", "none")):
+                            # e.g. "ward saves cannot be made": disable the stat
+                            totals[f"disable_{stat}"] = 1
+                            details.append(
+                                {
+                                    "source_uid": src.uid, "source_name": src.name,
+                                    "ability": ability.get("name", ""),
+                                    "stat": stat, "amount": 0, "mode": "disable",
+                                }
+                            )
+                            continue
+                        else:
+                            continue  # unintelligible set value; skip safely
                     # 'set' applies absolute values (e.g. gain WARD 5+)
-                    tn = target_number(mod.get("value", "")) or value
                     totals[f"set_{stat}"] = tn
+                    details.append(
+                        {
+                            "source_uid": src.uid, "source_name": src.name,
+                            "ability": ability.get("name", ""),
+                            "stat": stat, "amount": tn, "mode": "set",
+                        }
+                    )
                     continue
                 sign = -1 if mod.get("modifier_type") == "subtract" else 1
                 totals[stat] = totals.get(stat, 0) + sign * value
+                details.append(
+                    {
+                        "source_uid": src.uid, "source_name": src.name,
+                        "ability": ability.get("name", ""),
+                        "stat": stat, "amount": sign * value, "mode": "add",
+                    }
+                )
 
     out: dict[str, int] = {}
     for stat, v in totals.items():
@@ -106,14 +149,45 @@ def collect_mods(unit, all_units, phase: str | None) -> dict[str, int]:
         if stat in ROLL_STATS:
             v = max(-1, min(1, v))  # core rules: roll modifiers cap at +/-1
         out[stat] = v
-    return out
+    return out, details
+
+
+def collect_mods(unit, all_units, phase: str | None) -> dict[str, int]:
+    """Effective stat deltas only (see collect_mods_detailed)."""
+    return collect_mods_detailed(unit, all_units, phase)[0]
+
+
+# stats whose 'set' value is a roll target ("5+") rather than a number
+TARGET_ROLL_SET_STATS = {"ward", "save", "hit", "wound"}
+
+
+# human-readable effect description for the English battle log
+def describe_effect(d: dict) -> str:
+    stat = d["stat"]
+    if d["mode"] == "disable":
+        return f"{d['ability']} disables {stat} (from {d['source_name']})"
+    if d["mode"] == "set":
+        shown = f"{d['amount']}+" if stat in TARGET_ROLL_SET_STATS else d["amount"]
+        return f"{d['ability']} sets {stat} to {shown} (from {d['source_name']})"
+    amount = d["amount"]
+    if stat in ROLL_STATS:
+        verb = "improves" if amount < 0 else "worsens"
+        return (
+            f"{d['ability']} {verb} {stat} roll by {abs(amount)} "
+            f"(from {d['source_name']})"
+        )
+    sign = "+" if amount > 0 else ""
+    return f"{d['ability']} {sign}{amount} {stat} (from {d['source_name']})"
 
 
 def effective_ward(unit, mods: dict[str, int]) -> str:
-    """Best ward save after 'set ward' effects (lower target is better)."""
+    """Best ward save after 'set ward' effects (lower target is better).
+    'disable ward' debuffs (e.g. ward saves cannot be made) remove it."""
+    if mods.get("disable_ward"):
+        return ""
     own = target_number(unit.ward)
     granted = mods.get("set_ward")
-    candidates = [t for t in (own, granted) if t]
+    candidates = [t for t in (own, granted) if t and t >= 2]
     return f"{min(candidates)}+" if candidates else ""
 
 

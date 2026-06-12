@@ -1,6 +1,37 @@
 // Builds localized battle-log lines from the structured simulation
 // events. English uses the backend-generated text as-is; Korean is
 // composed here from the events' structured fields.
+const STAT_KO = {
+  hit: '명중',
+  wound: '상처',
+  save: '방어',
+  ward: '워드',
+  rend: '렌드',
+  damage: '피해',
+  move: '이동력',
+  control: '통제',
+  mortal_wound: '모탈 운드',
+};
+
+// roll stats: negative delta improves the target number (4+ -> 3+)
+const ROLL_STATS = new Set(['hit', 'wound', 'save']);
+
+function describeEffectKo(d) {
+  const stat = STAT_KO[d.stat] || d.stat;
+  if (d.mode === 'disable') {
+    return `${d.ability} → ${stat} 무효화 (시전: ${d.source_name})`;
+  }
+  if (d.mode === 'set') {
+    return `${d.ability} → ${stat} ${d.amount}+ 부여 (시전: ${d.source_name})`;
+  }
+  if (ROLL_STATS.has(d.stat)) {
+    const dir = d.amount < 0 ? '강화' : '약화';
+    return `${d.ability} → ${stat} 굴림 ${Math.abs(d.amount)} ${dir} (시전: ${d.source_name})`;
+  }
+  const sign = d.amount > 0 ? '+' : '';
+  return `${d.ability} → ${stat} ${sign}${d.amount} (시전: ${d.source_name})`;
+}
+
 export function formatEvent(ev, names, lang) {
   const n = (uid) => names[uid] || uid;
   if (lang !== 'ko') return ev.text || null;
@@ -16,6 +47,8 @@ export function formatEvent(ev, names, lang) {
       return `[돌격] ${n(ev.uid)} → ${n(ev.target)} 돌격 성공! (2D6=${ev.roll})`;
     case 'charge_failed':
       return `[돌격] ${n(ev.uid)} 돌격 실패 (2D6=${ev.roll})`;
+    case 'effects':
+      return `[효과] ${n(ev.uid)}: ${ev.effects.map(describeEffectKo).join('; ')}`;
     case 'attack': {
       const label =
         ev.kind === 'shoot' ? '사격' : ev.kind === 'mortal' ? '모탈' : '근접';
