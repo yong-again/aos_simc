@@ -105,6 +105,51 @@ export function formatEvent(ev, names, lang) {
         `[언바인드] ${n(ev.uid)} 시전 방해 시도 (2D6=${ev.roll} vs ${ev.against}) — ` +
         (ev.success ? '성공!' : '실패')
       );
+    case 'chant': {
+      if (ev.roll === 1 && !ev.success) {
+        return `[기도] ${n(ev.uid)} 챈팅 실패 (1D6=1) — 의식 포인트 ${ev.lost} 상실 (잔여 ${ev.points})`;
+      }
+      if (ev.success) {
+        const parts = [`1D6=${ev.roll}${ev.bonus ? `+${ev.bonus}` : ''}`];
+        if (ev.spent) parts.push(`의식 포인트 ${ev.spent} 소모`);
+        return `[기도] ${n(ev.uid)} '${ev.prayer}' 발동! (${parts.join(', ')})`;
+      }
+      return `[기도] ${n(ev.uid)} 의식 포인트 누적 (1D6=${ev.roll}, 합계 ${ev.points})`;
+    }
+    case 'summon':
+      return ev.success
+        ? `[소환] ${n(ev.uid)} → '${ev.manifestation}' 소환 성공 (시전 ${ev.roll})`
+        : `[소환] ${n(ev.uid)} '${ev.manifestation}' 소환 실패 (시전 ${ev.roll}, 필요 ${ev.needed}+)`;
+    case 'banish':
+      return (
+        `[추방] ${n(ev.uid)} → ${n(ev.target)} 추방 시도 ` +
+        `(2D6=${ev.roll}${ev.bonus ? `+${ev.bonus}` : ''} vs ${ev.needed}) — ` +
+        (ev.success ? '추방됨!' : '잔존')
+      );
+    case 'manifestation_removed': {
+      const REASON_KO = {
+        banished: '추방됨',
+        'its summoner was slain': '소환자 사망',
+      };
+      return `[소환물 제거] ${n(ev.uid)} (${REASON_KO[ev.reason] || ev.reason})`;
+    }
+    case 'terrain_power':
+      if (ev.damage !== undefined && ev.roll === 1) {
+        return (
+          `[지형] ${n(ev.uid)} Place of Power 역류 (D6=1) — 모탈 피해 ${ev.damage}` +
+          (ev.slain ? ` — ${n(ev.uid)} 파괴!` : '')
+        );
+      }
+      return (
+        `[지형] ${n(ev.uid)} Place of Power 공명 (D6=${ev.roll}) — ` +
+        (ev.buff === 'plus1' ? '이번 턴 시전/챈팅 +1' : '이번 턴 WIZARD(1) 취급 (언바인드/추방 가능)')
+      );
+    case 'cover':
+      return `[지형] ${n(ev.uid)} 엄폐 중 (${ev.terrain}) — 명중 -1`;
+    case 'visibility':
+      return `[시야] ${n(ev.uid)} → ${n(ev.target)} 사격 불가 (${ev.terrain}에 가려짐)`;
+    case 'terrain_move':
+      return `[지형] ${n(ev.uid)} 이동 제한: ${ev.notes.join(', ')}`;
     case 'cp_reset':
       return `${ev.round_no}라운드 종료 — 미사용 CP 소멸`;
     case 'charge':
