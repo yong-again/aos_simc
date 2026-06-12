@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import random
 
-from .combat import roll_value, target_number
+from .combat import roll_value, target_number, ward_roll
 
 AURA_RANGE = {
     "friendly_within_12": 12.0,
@@ -212,11 +212,19 @@ def apply_turn_mortal_wounds(sim, side: str) -> None:
                 if not targets:
                     continue
                 target = min(targets, key=u.distance)
-                dmg = roll_value(mod.get("value", "1"), sim.rng) or 1
+                rolled = roll_value(mod.get("value", "1"), sim.rng) or 1
+                # mortal wounds skip normal saves but Ward still applies
+                ward = effective_ward(
+                    target, collect_mods(target, sim.units, None)
+                )
+                dmg, warded = ward_roll(rolled, ward, sim.rng)
+                if warded > 0:
+                    sim.emit_defense(target, ward, warded, dmg)
                 target.wounds_taken += dmg
                 slain = not target.alive
                 sim.emit(
-                    type="attack", kind="mortal", uid=u.uid, target=target.uid,
+                    type="attack", category="HERO", kind="mortal",
+                    uid=u.uid, target=target.uid,
                     damage=dmg, slain=slain, ability=ability.get("name", ""),
                     text=f"{u.name} inflicts {dmg} mortal wound(s) on {target.name}"
                     f" [{ability.get('name', '')}]"

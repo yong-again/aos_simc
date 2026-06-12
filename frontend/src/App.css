@@ -120,6 +120,18 @@ button.big { width: 100%; padding: 12px; font-size: 15px; margin-top: 12px; }
   font-size: 12px; min-height: 80px;
 }
 
+/* category-colored battle log lines (event.category from the engine) */
+.log-line { line-height: 1.55; white-space: pre-wrap; }
+.log-PHASE { color: #8a93a5; font-weight: 700; margin-top: 3px; }
+.log-HERO { color: #d4af37; }
+.log-MOVE { color: #9aa3b2; }
+.log-SHOOT { color: #ffd34d; }
+.log-CHARGE { color: #ff9d5c; }
+.log-COMBAT { color: #ff7a6b; }
+.log-DEFENSE { color: #6db3f2; }
+.log-EFFECT { color: #c084fc; }
+.log-SYSTEM { color: var(--text); font-weight: 600; }
+
 /* unit panel */
 .unit-panel {
   background: var(--panel); border: 1px solid var(--border); border-radius: 6px;

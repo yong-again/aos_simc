@@ -171,10 +171,22 @@ class BattleSimulator:
         return [u for u in self.units if u.side != unit.side and u.alive]
 
     def emit(self, **event):
+        """Appends a structured event. Every event carries a ``category``
+        (PHASE/HERO/MOVE/SHOOT/CHARGE/COMBAT/DEFENSE/EFFECT/SYSTEM) so the
+        frontend can render log lines by kind without parsing text."""
+        event.setdefault("category", "SYSTEM")
         event["round"] = self.round
         self.events.append(event)
         if event.get("text"):
             self.log.append(f"[R{self.round}] {event['text']}")
+
+    def phase_marker(self, side: str, phase: str):
+        """Explicit separator logged at the start of every phase."""
+        label = phase.replace("_", " ").title()
+        self.emit(
+            type="phase", category="PHASE", side=side, phase=phase,
+            text=f"=== [R{self.round}] {side} {label} Phase ===",
+        )
 
     def snapshot(self):
         return [
@@ -190,8 +202,19 @@ class BattleSimulator:
         ]
 
     # -- phases --------------------------------------------------------
+    def hero_phase(self, side: str):
+        """Hero phase skeleton: start-of-turn abilities resolve here.
+        Command abilities / heroic actions hook in here later."""
+        self.phase_marker(side, "hero")
+        apply_turn_mortal_wounds(self, side)
+
+    def end_phase(self, side: str):
+        """End phase skeleton: end-of-turn effects (battleshock, expiring
+        buffs) hook in here later."""
+        self.phase_marker(side, "end")
+
     def movement_phase(self, side: str):
-        self.emit(type="phase", side=side, phase="movement")
+        self.phase_marker(side, "movement")
         for u in self.side_units(side):
             enemies = self.enemies_of(u)
             if not enemies:
@@ -218,7 +241,7 @@ class BattleSimulator:
             nx = min(max(nx, 0.5), BOARD_W - 0.5)
             ny = min(max(ny, 0.5), BOARD_H - 0.5)
             self.emit(
-                type="move", uid=u.uid, target=target.uid,
+                type="move", category="MOVE", uid=u.uid, target=target.uid,
                 dist=round(step, 1),
                 frm=[round(u.x, 2), round(u.y, 2)],
                 to=[round(nx, 2), round(ny, 2)],
@@ -227,7 +250,7 @@ class BattleSimulator:
             u.x, u.y = nx, ny
 
     def shooting_phase(self, side: str):
-        self.emit(type="phase", side=side, phase="shooting")
+        self.phase_marker(side, "shooting")
         for u in self.side_units(side):
             if not u.ranged:
                 continue
@@ -254,12 +277,13 @@ class BattleSimulator:
             self.emit_effects(u, atk_details, "attacker")
             self.emit_effects(target, def_details, "defender")
             ward = effective_ward(target, def_mods)
-            dmg = unit_attack(weapons, u.models_alive, target.save, self.rng,
-                              ward, atk_mods, def_mods)
-            self.apply_damage(u, target, dmg, "shoots", "shoot")
+            dmg, warded = unit_attack(weapons, u.models_alive, target.save, self.rng,
+                                      ward, atk_mods, def_mods)
+            self.apply_damage(u, target, dmg, "shoots", "shoot",
+                              warded=warded, ward=ward, applied_details=atk_details)
 
     def charge_phase(self, side: str):
-        self.emit(type="phase", side=side, phase="charge")
+        self.phase_marker(side, "charge")
         for u in self.side_units(side):
             if not u.melee:
                 continue
@@ -276,19 +300,19 @@ class BattleSimulator:
                 nx = u.x + (target.x - u.x) / dist * travel
                 ny = u.y + (target.y - u.y) / dist * travel
                 self.emit(
-                    type="charge", uid=u.uid, target=target.uid, roll=charge_roll,
+                    type="charge", category="CHARGE", uid=u.uid, target=target.uid, roll=charge_roll,
                     frm=[round(u.x, 2), round(u.y, 2)], to=[round(nx, 2), round(ny, 2)],
                     text=f"{u.name} charges {target.name} (rolled {charge_roll})",
                 )
                 u.x, u.y = nx, ny
             else:
                 self.emit(
-                    type="charge_failed", uid=u.uid, roll=charge_roll,
+                    type="charge_failed", category="CHARGE", uid=u.uid, roll=charge_roll,
                     text=f"{u.name} fails its charge (rolled {charge_roll})",
                 )
 
     def combat_phase(self, side: str):
-        self.emit(type="phase", side=side, phase="combat")
+        self.phase_marker(side, "combat")
         # both sides fight in the combat phase, active player's units first
         order = self.side_units(side) + self.side_units(
             "enemy" if side == "player" else "player"
@@ -308,9 +332,10 @@ class BattleSimulator:
             self.emit_effects(u, atk_details, "attacker")
             self.emit_effects(target, def_details, "defender")
             ward = effective_ward(target, def_mods)
-            dmg = unit_attack(u.melee, u.models_alive, target.save, self.rng,
-                              ward, atk_mods, def_mods)
-            self.apply_damage(u, target, dmg, "hits", "melee")
+            dmg, warded = unit_attack(u.melee, u.models_alive, target.save, self.rng,
+                                      ward, atk_mods, def_mods)
+            self.apply_damage(u, target, dmg, "hits", "melee",
+                              warded=warded, ward=ward, applied_details=atk_details)
 
     def emit_effects(self, unit: SimUnit, details: list, role: str):
         """Logs which abilities are affecting ``unit`` and who cast them.
@@ -326,23 +351,58 @@ class BattleSimulator:
         self._last_effects[unit.uid] = key
         summary = "; ".join(describe_effect(d) for d in details)
         self.emit(
-            type="effects", uid=unit.uid, role=role, effects=details,
+            type="effects", category="EFFECT", uid=unit.uid, role=role, effects=details,
             text=f"{unit.name} is affected by: {summary}",
         )
 
-    def apply_damage(self, attacker: SimUnit, target: SimUnit, dmg: int, verb: str, kind: str):
+    @staticmethod
+    def _attack_effect_brief(details: list) -> tuple[list, str]:
+        """Filters effect details down to the stats that influence an
+        attack roll and renders a short suffix for the log line, e.g.
+        "(applied: 'Aether-gold' hit+1)". Roll-stat signs are flipped
+        for display: an internal -1 on the target number is shown +1."""
+        relevant = [d for d in details if d["stat"] in ("hit", "wound", "rend", "damage")]
+        if not relevant:
+            return [], ""
+        parts = []
+        for d in relevant:
+            shown = -d["amount"] if d["stat"] in ("hit", "wound") else d["amount"]
+            parts.append(f"'{d['ability']}' {d['stat']}{shown:+d}")
+        return relevant, f" (applied: {', '.join(parts)})"
+
+    def emit_defense(self, target: SimUnit, ward: str, warded: int, final: int):
+        """Explicit log when a Ward save negates damage."""
+        self.emit(
+            type="defense", category="DEFENSE", uid=target.uid,
+            ward=ward, negated=warded, final_damage=final,
+            text=f"{target.name} negates {warded} damage with its "
+            f"'Ward {ward}' save! (final damage: {final})",
+        )
+
+    def apply_damage(
+        self, attacker: SimUnit, target: SimUnit, dmg: int, verb: str, kind: str,
+        warded: int = 0, ward: str = "", applied_details: list | None = None,
+    ):
+        category = {"shoot": "SHOOT", "melee": "COMBAT", "mortal": "HERO"}.get(
+            kind, "COMBAT"
+        )
+        applied, suffix = self._attack_effect_brief(applied_details or [])
+        if warded > 0:
+            self.emit_defense(target, ward, warded, dmg)
         if dmg <= 0:
             self.emit(
-                type="attack", kind=kind, uid=attacker.uid, target=target.uid, damage=0,
-                text=f"{attacker.name} {verb} {target.name} but deals no damage",
+                type="attack", category=category, kind=kind,
+                uid=attacker.uid, target=target.uid, damage=0, applied=applied,
+                text=f"{attacker.name} {verb} {target.name} but deals no damage{suffix}",
             )
             return
         target.wounds_taken += dmg
         slain = not target.alive
         self.emit(
-            type="attack", kind=kind, uid=attacker.uid, target=target.uid, damage=dmg,
+            type="attack", category=category, kind=kind,
+            uid=attacker.uid, target=target.uid, damage=dmg, applied=applied,
             slain=slain,
-            text=f"{attacker.name} {verb} {target.name} for {dmg} damage"
+            text=f"{attacker.name} {verb} {target.name} for {dmg} damage{suffix}"
             + (f" — {target.name} is destroyed!" if slain else ""),
         )
 
@@ -355,17 +415,18 @@ class BattleSimulator:
             # roll-off for priority each battle round
             first = "player" if self.rng.random() < 0.5 else "enemy"
             second = "enemy" if first == "player" else "player"
-            self.emit(type="round", round_no=rnd, first=first,
+            self.emit(type="round", category="PHASE", round_no=rnd, first=first,
                       text=f"Battle round {rnd} begins — {first} goes first")
             for side in (first, second):
                 if not self.side_units("player") or not self.side_units("enemy"):
                     break
-                self.emit(type="turn", side=side)
-                apply_turn_mortal_wounds(self, side)
+                self.emit(type="turn", category="PHASE", side=side)
+                self.hero_phase(side)
                 self.movement_phase(side)
                 self.shooting_phase(side)
                 self.charge_phase(side)
                 self.combat_phase(side)
+                self.end_phase(side)
                 self.emit(type="state", units=self.snapshot())
             if not self.side_units("player") or not self.side_units("enemy"):
                 break

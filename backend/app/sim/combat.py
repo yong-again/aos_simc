@@ -109,8 +109,12 @@ def resolve_damage(
     ward_stat: str = "",
     atk_mods: dict | None = None,
     def_mods: dict | None = None,
-) -> int:
+) -> tuple[int, int]:
     """Apply save rolls (modified by Rend), roll damage, then ward rolls.
+
+    Returns ``(damage, warded)`` — the final damage dealt plus how many
+    damage points the defender's Ward save negated, so the engine can
+    log the defensive gimmick explicitly.
 
     ``atk_mods`` may add 'rend'/'damage'; ``def_mods`` may shift 'save'
     (negative improves the save, same convention as roll targets)."""
@@ -121,6 +125,7 @@ def resolve_damage(
     rend = max(0, rend_value(weapon["rend"]) + atk_mods.get("rend", 0))
     dmg_bonus = atk_mods.get("damage", 0)
     damage = 0
+    warded = 0
     for _ in range(wounding_hits):
         if save_t is not None:
             needed = save_t + rend + def_mods.get("save", 0)
@@ -129,9 +134,24 @@ def resolve_damage(
         per_hit = max(1, (roll_value(weapon["damage"], rng) or 1) + dmg_bonus)
         for _ in range(per_hit):
             if ward_t is not None and rng.randint(1, 6) >= ward_t:
-                continue  # warded
+                warded += 1  # ward save negates this damage point
+                continue
             damage += 1
-    return damage
+    return damage, warded
+
+
+def ward_roll(damage: int, ward_stat: str, rng: random.Random) -> tuple[int, int]:
+    """Roll a Ward save against ``damage`` points (used for mortal
+    wounds, which skip normal saves but not wards).
+    Returns ``(damage_through, warded)``."""
+    ward_t = target_number(ward_stat)
+    if ward_t is None:
+        return damage, 0
+    through = 0
+    for _ in range(damage):
+        if rng.randint(1, 6) < ward_t:
+            through += 1
+    return through, damage - through
 
 
 def unit_attack(
@@ -142,15 +162,19 @@ def unit_attack(
     defender_ward: str = "",
     atk_mods: dict | None = None,
     def_mods: dict | None = None,
-) -> int:
-    """Full attack sequence for all of a unit's weapon profiles."""
+) -> tuple[int, int]:
+    """Full attack sequence for all of a unit's weapon profiles.
+    Returns ``(damage, warded)`` aggregated over every profile."""
     total = 0
+    warded_total = 0
     for weapon in attacker_weapons:
         wounds = roll_attacks(weapon, models, rng, atk_mods)
-        total += resolve_damage(
+        dmg, warded = resolve_damage(
             wounds, weapon, defender_save, rng, defender_ward, atk_mods, def_mods
         )
-    return total
+        total += dmg
+        warded_total += warded
+    return total, warded_total
 
 
 def expected_damage(weapons: list[dict], models: int, defender_save: str) -> float:

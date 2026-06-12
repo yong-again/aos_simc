@@ -209,6 +209,26 @@ function drawEffect(ctx, fx, age, pos) {
       ctx.restore();
       break;
     }
+    case 'ward': {
+      // ward save: protective blue ring pulsing around the defender
+      const p = fx.at;
+      if (!p) return;
+      const cx = inToPx(p.x ?? p[0]);
+      const cy = inToPx(p.y ?? p[1]);
+      ctx.save();
+      ctx.globalAlpha = fade;
+      ctx.strokeStyle = '#6db3f2';
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.arc(cx, cy, inToPx(1.0) + Math.sin(age * Math.PI) * inToPx(0.5), 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.font = `${inToPx(1.0)}px sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('🛡️', cx, cy - inToPx(1.8));
+      ctx.restore();
+      break;
+    }
     case 'death': {
       // expanding shockwave ring + skull
       const p = fx.at;
