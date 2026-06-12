@@ -3,18 +3,30 @@
 Takes plain text copied from army builders such as New Recruit and
 returns a validated ``Roster`` (Pydantic) using Gemini structured
 output (``response_schema``), as required by the spec.
+
+Parse results are cached on disk keyed by a hash of the roster text,
+so re-parsing the same roster (common while testing) costs no Gemini
+calls. Delete ``app/data/roster_cache.json`` to clear the cache.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
+import re
+import threading
 
 from google import genai
 from google.genai import types
 
 from ..models.roster import Roster
+from ..scraper.wahapedia import DATA_DIR
 
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
+
+ROSTER_CACHE_FILE = DATA_DIR / "roster_cache.json"
+_cache_lock = threading.Lock()
 
 PARSE_PROMPT = """\
 You are a parser for Warhammer Age of Sigmar 4th edition army rosters.
@@ -85,9 +97,42 @@ def _structured_call(prompt: str) -> Roster:
     return Roster.model_validate_json(response.text)
 
 
-def parse_roster_text(roster_text: str) -> Roster:
-    """Parse free-form army builder text into a validated Roster."""
-    return _structured_call(PARSE_PROMPT.format(roster_text=roster_text))
+def _roster_cache_key(roster_text: str) -> str:
+    """Hash of the roster text, insensitive to whitespace differences so
+    re-pasting the same roster hits the cache."""
+    normalized = re.sub(r"\s+", " ", roster_text).strip().lower()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
+
+
+def _load_roster_cache() -> dict:
+    if ROSTER_CACHE_FILE.exists():
+        return json.loads(ROSTER_CACHE_FILE.read_text(encoding="utf-8"))
+    return {}
+
+
+def parse_roster_text(roster_text: str, use_cache: bool = True) -> Roster:
+    """Parse free-form army builder text into a validated Roster.
+
+    Identical roster text is served from the disk cache without calling
+    Gemini; pass ``use_cache=False`` to force a fresh parse.
+    """
+    key = _roster_cache_key(roster_text)
+    if use_cache:
+        with _cache_lock:
+            cached = _load_roster_cache().get(key)
+        if cached is not None:
+            return Roster.model_validate(cached)
+
+    roster = _structured_call(PARSE_PROMPT.format(roster_text=roster_text))
+
+    with _cache_lock:
+        cache = _load_roster_cache()
+        cache[key] = roster.model_dump()
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        ROSTER_CACHE_FILE.write_text(
+            json.dumps(cache, ensure_ascii=False, indent=1), encoding="utf-8"
+        )
+    return roster
 
 
 def generate_opponent_roster(

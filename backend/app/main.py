@@ -38,6 +38,7 @@ app.add_middleware(
 
 class RosterText(BaseModel):
     text: str
+    force: bool = False  # true: bypass the parse cache and call Gemini
 
 
 class GenerateRequest(BaseModel):
@@ -87,7 +88,7 @@ def parse_roster(body: RosterText):
     if not body.text.strip():
         raise HTTPException(400, "Empty roster text")
     try:
-        roster = parse_roster_text(body.text)
+        roster = parse_roster_text(body.text, use_cache=not body.force)
     except RuntimeError as e:
         raise HTTPException(500, str(e))
     return merge_roster(roster)
