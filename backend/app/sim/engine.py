@@ -210,13 +210,20 @@ class BattleSimulator:
         return True
 
     def emit_command(self, side: str, command: str, unit: SimUnit,
-                     category: str, detail: str, healed: int = 0):
+                     category: str, detail: str, healed: int = 0, **extra):
         self.emit(
             type="command", category=category, side=side, command=command,
-            uid=unit.uid, cp_left=self.cp[side], healed=healed,
+            uid=unit.uid, cp_left=self.cp[side], healed=healed, **extra,
             text=f"{unit.name} uses '{command}' — {detail} "
             f"(CP left: {self.cp[side]})",
         )
+
+    @staticmethod
+    def _other(side: str) -> str:
+        return "enemy" if side == "player" else "player"
+
+    def _in_combat(self, unit: SimUnit) -> bool:
+        return any(unit.distance(e) <= COMBAT_RANGE for e in self.enemies_of(unit))
 
     def try_all_out_attack(self, side: str, attacker: SimUnit,
                            atk_mods: dict, category: str) -> None:
@@ -241,6 +248,154 @@ class BattleSimulator:
             return
         def_mods["save"] = max(-1, def_mods.get("save", 0) - 1)
         self.emit_command(side, "All-out Defence", defender, category, "+1 to save")
+
+    # -- reactive commands (opponent's turn, AoS4 advanced reactions) ----
+    def reaction_redeploy(self, side: str):
+        """Redeploy (1 CP): right after the opponent's movement phase, a
+        shooting-focused unit threatened by a strong melee unit within 9"
+        falls back D6" to open the distance."""
+        if self.cp[side] <= 0:
+            return
+        for u in self.side_units(side):
+            if not u.ranged or self._in_combat(u):
+                continue
+            # melee units hold their ground; only shooters back off
+            shooter = expected_damage(u.ranged, u.models_alive, "4+") >= \
+                expected_damage(u.melee, u.models_alive, "4+")
+            if not shooter:
+                continue
+            threats = [
+                e for e in self.enemies_of(u)
+                if e.melee and u.distance(e) <= 9.0
+                and expected_damage(e.melee, e.models_alive, u.save) >= 3.0
+            ]
+            if not threats:
+                continue
+            threat = max(
+                threats,
+                key=lambda e: expected_damage(e.melee, e.models_alive, u.save),
+            )
+            if not self.spend_cp(side):
+                return
+            roll = self.rng.randint(1, 6)
+            dist = u.distance(threat) or 0.1
+            nx = min(max(u.x + (u.x - threat.x) / dist * roll, 0.5), BOARD_W - 0.5)
+            ny = min(max(u.y + (u.y - threat.y) / dist * roll, 0.5), BOARD_H - 0.5)
+            self.emit_command(
+                side, "Redeploy", u, "MOVE",
+                f"falls back {roll}\" away from {threat.name}", roll=roll,
+            )
+            # silent move event: animates on the canvas without a log line
+            self.emit(
+                type="move", category="MOVE", uid=u.uid, target=threat.uid,
+                dist=float(roll), silent=True,
+                frm=[round(u.x, 2), round(u.y, 2)], to=[round(nx, 2), round(ny, 2)],
+            )
+            u.x, u.y = nx, ny
+            return  # one Redeploy per reaction window
+
+    def reaction_covering_fire(self, side: str):
+        """Covering Fire (1 CP): shoot during the opponent's shooting
+        phase at -1 to hit. Used only with spare CP (2+) so All-out
+        Defence / Counter-charge stay affordable."""
+        if self.cp[side] < 2:
+            return
+        for u in self.side_units(side):
+            if not u.ranged or self._in_combat(u):
+                continue
+            max_range = max(_num(w.get("range", "")) for w in u.ranged)
+            targets = [e for e in self.enemies_of(u) if u.distance(e) <= max_range]
+            if not targets:
+                continue
+            target = max(
+                targets,
+                key=lambda e: expected_damage(u.ranged, u.models_alive, e.save),
+            )
+            # not worth a CP if the volley barely scratches at -1 to hit
+            if expected_damage(u.ranged, u.models_alive, target.save) < 2.0:
+                continue
+            if not self.spend_cp(side):
+                return
+            atk_mods, atk_details = collect_mods_detailed(u, self.units, "shooting")
+            atk_mods["hit"] = min(1, atk_mods.get("hit", 0) + 1)  # -1 to hit
+            def_mods, _ = collect_mods_detailed(target, self.units, "shooting")
+            ward = effective_ward(target, def_mods)
+            self.emit_command(
+                side, "Covering Fire", u, "SHOOT",
+                f"shoots {target.name} at -1 to hit",
+            )
+            dmg, warded = unit_attack(u.ranged, u.models_alive, target.save,
+                                      self.rng, ward, atk_mods, def_mods)
+            self.apply_damage(u, target, dmg, "shoots", "shoot",
+                              warded=warded, ward=ward, applied_details=atk_details)
+            return  # one Covering Fire per reaction window
+
+    def reaction_counter_charge(self, side: str):
+        """Counter-charge (1 CP): right after the opponent's charge phase,
+        a strong melee unit (MONSTER/HERO) within 12" intercepts a charger
+        that reached one of our fragile units."""
+        if self.cp[side] <= 0:
+            return
+        for ally in self.side_units(side):
+            # fragile: weak in melee (wizards, artillery, shooters)
+            fragile = (
+                ally.is_war_machine
+                or expected_damage(ally.melee, ally.models_alive, "4+") < 3.0
+            )
+            if not fragile:
+                continue
+            chargers = [
+                e for e in self.enemies_of(ally)
+                if e.melee and ally.distance(e) <= COMBAT_RANGE
+            ]
+            if not chargers:
+                continue
+            charger = max(
+                chargers,
+                key=lambda e: expected_damage(e.melee, e.models_alive, ally.save),
+            )
+            interceptors = [
+                u for u in self.side_units(side)
+                if u is not ally and (u.is_monster or u.is_hero) and u.melee
+                and not self._in_combat(u)
+                and COMBAT_RANGE < u.distance(charger) <= 12.0 + COMBAT_RANGE
+                # only intercept when the hit actually hurts: meaningful
+                # absolute damage, or a real dent in the charger's health
+                and expected_damage(u.melee, u.models_alive, charger.save)
+                >= min(2.0, charger.total_health * 0.25)
+            ]
+            if not interceptors:
+                continue
+            u = max(
+                interceptors,
+                key=lambda x: expected_damage(x.melee, x.models_alive, charger.save),
+            )
+            if not self.spend_cp(side):
+                return
+            roll = self.rng.randint(1, 6) + self.rng.randint(1, 6)
+            dist = u.distance(charger)
+            self.emit_command(
+                side, "Counter-charge", u, "CHARGE",
+                f"counter-charges {charger.name} to protect {ally.name} (2D6={roll})",
+                roll=roll,
+            )
+            if roll >= dist - COMBAT_RANGE + 0.5:
+                travel = dist - 1.0
+                nx = u.x + (charger.x - u.x) / dist * travel
+                ny = u.y + (charger.y - u.y) / dist * travel
+                self.emit(
+                    type="charge", category="CHARGE", uid=u.uid,
+                    target=charger.uid, roll=roll, silent=True,
+                    frm=[round(u.x, 2), round(u.y, 2)],
+                    to=[round(nx, 2), round(ny, 2)],
+                )
+                u.x, u.y = nx, ny
+            else:
+                self.emit(
+                    type="charge_failed", category="CHARGE", uid=u.uid, roll=roll,
+                    text=f"{u.name}'s counter-charge falls short (rolled {roll})",
+                )
+            return  # one Counter-charge per reaction window
 
     # -- phases --------------------------------------------------------
     def hero_phase(self, side: str):
@@ -277,6 +432,11 @@ class BattleSimulator:
 
     def movement_phase(self, side: str):
         self.phase_marker(side, "movement")
+        self._movement_actions(side)
+        # reaction hook: the inactive player may Redeploy
+        self.reaction_redeploy(self._other(side))
+
+    def _movement_actions(self, side: str):
         for u in self.side_units(side):
             enemies = self.enemies_of(u)
             if not enemies:
@@ -290,8 +450,9 @@ class BattleSimulator:
             if move_mod:
                 self.emit_effects(u, [d for d in move_details if d["stat"] == "move"], "mover")
             eff_move = max(0.0, u.move + move_mod)
-            # stop just outside combat range so the charge phase decides
-            step = min(eff_move, max(dist - (COMBAT_RANGE - 0.5), 0))
+            # core rules: normal moves cannot enter combat range — stop
+            # just outside (3.5") and let the charge phase close the gap
+            step = min(eff_move, max(dist - (COMBAT_RANGE + 0.5), 0))
             # don't walk into melee if we'd rather shoot from range
             if u.ranged and not u.melee:
                 shoot_rng = max(_num(w.get("range", "")) for w in u.ranged)
@@ -313,6 +474,11 @@ class BattleSimulator:
 
     def shooting_phase(self, side: str):
         self.phase_marker(side, "shooting")
+        self._shooting_actions(side)
+        # reaction hook: the inactive player may use Covering Fire
+        self.reaction_covering_fire(self._other(side))
+
+    def _shooting_actions(self, side: str):
         for u in self.side_units(side):
             if not u.ranged:
                 continue
@@ -348,6 +514,11 @@ class BattleSimulator:
 
     def charge_phase(self, side: str):
         self.phase_marker(side, "charge")
+        self._charge_actions(side)
+        # reaction hook: the inactive player may Counter-charge
+        self.reaction_counter_charge(self._other(side))
+
+    def _charge_actions(self, side: str):
         for u in self.side_units(side):
             if not u.melee:
                 continue
