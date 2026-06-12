@@ -174,6 +174,22 @@ export default function App() {
           us.map((u) => (u.uid === ev.uid ? { ...u, x: ev.to[0], y: ev.to[1] } : u))
         );
         break;
+      case 'retreat':
+        // falls back out of combat and pays D3 mortal damage
+        setUnits((us) =>
+          us.map((u) =>
+            u.uid === ev.uid
+              ? {
+                  ...u,
+                  x: ev.to[0],
+                  y: ev.to[1],
+                  health: Math.max(0, u.health - (ev.damage || 0)),
+                  alive: !ev.slain,
+                }
+              : u
+          )
+        );
+        break;
       case 'attack':
         if (ev.damage > 0) {
           setUnits((us) =>
@@ -196,6 +212,17 @@ export default function App() {
             return s ? { ...u, ...s } : u;
           })
         );
+        break;
+      case 'miscast':
+        if (ev.damage > 0) {
+          setUnits((us) =>
+            us.map((u) =>
+              u.uid === ev.uid
+                ? { ...u, health: Math.max(0, u.health - ev.damage), alive: !ev.slain }
+                : u
+            )
+          );
+        }
         break;
       case 'defense':
         setUnits((current) => {
@@ -250,7 +277,7 @@ export default function App() {
           const fx = [];
           if (ev.kind === 'shoot') {
             fx.push({ kind: 'tracer', fromUid: ev.uid, toUid: ev.target, ttl: 650 });
-          } else if (ev.kind === 'mortal') {
+          } else if (ev.kind === 'mortal' || ev.kind === 'spell') {
             // mortal wounds: purple arcane slash, no save possible
             fx.push({
               kind: 'slash', toUid: ev.target, color: '#c084fc',

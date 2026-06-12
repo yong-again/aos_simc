@@ -18,7 +18,7 @@ import random
 import re
 from dataclasses import dataclass, field
 
-from .combat import expected_damage, roll_value, unit_attack
+from .combat import expected_damage, roll_value, unit_attack, ward_roll
 from .effects import (
     apply_turn_mortal_wounds,
     collect_mods,
@@ -57,6 +57,33 @@ class SimUnit:
     ranged: list = field(default_factory=list)
     melee: list = field(default_factory=list)
     abilities_raw: list = field(default_factory=list)
+    keywords: list = field(default_factory=list)
+
+    @property
+    def wizard_level(self) -> int:
+        """X from the 'WIZARD ( X )' keyword: casts/unbinds per phase."""
+        for k in self.keywords:
+            m = re.match(r"WIZARD\s*\(\s*(\d+)\s*\)", k)
+            if m:
+                return int(m.group(1))
+        return 0
+
+    @property
+    def has_musician(self) -> bool:
+        return any(k.startswith("MUSICIAN") for k in self.keywords)
+
+    @property
+    def strike_first(self) -> bool:
+        return any("STRIKE-FIRST" in k for k in self.keywords)
+
+    @property
+    def strike_last(self) -> bool:
+        return any("STRIKE-LAST" in k for k in self.keywords)
+
+    @property
+    def untargetable_by_covering_fire(self) -> bool:
+        """Manifestations and faction terrain can't be shot by Covering Fire."""
+        return any(k in ("MANIFESTATION", "FACTION TERRAIN") for k in self.keywords)
 
     @property
     def total_health(self) -> int:
@@ -128,6 +155,7 @@ def build_sim_units(merged_roster: dict, side: str) -> list[SimUnit]:
                 ranged=ws.get("ranged_weapons", []),
                 melee=ws.get("melee_weapons", []),
                 abilities_raw=ws.get("abilities", []),
+                keywords=keywords,
             )
         )
 
@@ -161,6 +189,9 @@ class BattleSimulator:
         self.round = 0
         self._last_effects: dict[str, tuple] = {}
         self.cp = {"player": 0, "enemy": 0}  # command points (4/round, AoS4)
+        # Rules of One bookkeeping, reset at every phase marker:
+        self._unit_commands: set[str] = set()   # uids that used a command
+        self._army_commands = {"player": set(), "enemy": set()}  # command names
 
     # -- helpers -------------------------------------------------------
     def side_units(self, side: str, alive_only: bool = True):
@@ -182,7 +213,10 @@ class BattleSimulator:
             self.log.append(f"[R{self.round}] {event['text']}")
 
     def phase_marker(self, side: str, phase: str):
-        """Explicit separator logged at the start of every phase."""
+        """Explicit separator logged at the start of every phase. Also
+        resets the Rules-of-One command limits (per unit / per army)."""
+        self._unit_commands.clear()
+        self._army_commands = {"player": set(), "enemy": set()}
         label = phase.replace("_", " ").title()
         self.emit(
             type="phase", category="PHASE", side=side, phase=phase,
@@ -203,10 +237,19 @@ class BattleSimulator:
         ]
 
     # -- command abilities (AoS4 core) ----------------------------------
-    def spend_cp(self, side: str) -> bool:
-        if self.cp[side] <= 0:
+    def use_command(self, side: str, command: str, unit: SimUnit, cost: int = 1) -> bool:
+        """Spends CP subject to the Rules of One: a unit may use only one
+        command per phase, and each command may be used only once per
+        army per phase."""
+        if self.cp[side] < cost:
             return False
-        self.cp[side] -= 1
+        if unit.uid in self._unit_commands:
+            return False
+        if command in self._army_commands[side]:
+            return False
+        self.cp[side] -= cost
+        self._unit_commands.add(unit.uid)
+        self._army_commands[side].add(command)
         return True
 
     def emit_command(self, side: str, command: str, unit: SimUnit,
@@ -230,7 +273,7 @@ class BattleSimulator:
         """All-out Attack (1 CP): +1 to hit for this unit's attacks."""
         if atk_mods.get("hit", 0) <= -1:
             return  # hit roll already at the +1 cap
-        if not self.spend_cp(side):
+        if not self.use_command(side, "All-out Attack", attacker):
             return
         atk_mods["hit"] = max(-1, atk_mods.get("hit", 0) - 1)
         self.emit_command(side, "All-out Attack", attacker, category, "+1 to hit")
@@ -244,16 +287,16 @@ class BattleSimulator:
             return
         if def_mods.get("save", 0) <= -1:
             return
-        if not self.spend_cp(side):
+        if not self.use_command(side, "All-out Defence", defender):
             return
         def_mods["save"] = max(-1, def_mods.get("save", 0) - 1)
         self.emit_command(side, "All-out Defence", defender, category, "+1 to save")
 
     # -- reactive commands (opponent's turn, AoS4 advanced reactions) ----
     def reaction_redeploy(self, side: str):
-        """Redeploy (1 CP): right after the opponent's movement phase, a
-        shooting-focused unit threatened by a strong melee unit within 9"
-        falls back D6" to open the distance."""
+        """Redeploy (1 CP): right after the opponent's movement phase, any
+        friendly unit not in combat may fall back D6". The AI uses it for
+        shooting-focused units threatened by a strong melee charge."""
         if self.cp[side] <= 0:
             return
         for u in self.side_units(side):
@@ -264,9 +307,10 @@ class BattleSimulator:
                 expected_damage(u.melee, u.models_alive, "4+")
             if not shooter:
                 continue
+            # heuristic: a strong melee unit within charge threat (15")
             threats = [
                 e for e in self.enemies_of(u)
-                if e.melee and u.distance(e) <= 9.0
+                if e.melee and u.distance(e) <= 12.0 + COMBAT_RANGE
                 and expected_damage(e.melee, e.models_alive, u.save) >= 3.0
             ]
             if not threats:
@@ -275,7 +319,7 @@ class BattleSimulator:
                 threats,
                 key=lambda e: expected_damage(e.melee, e.models_alive, u.save),
             )
-            if not self.spend_cp(side):
+            if not self.use_command(side, "Redeploy", u):
                 return
             roll = self.rng.randint(1, 6)
             dist = u.distance(threat) or 0.1
@@ -304,17 +348,21 @@ class BattleSimulator:
             if not u.ranged or self._in_combat(u):
                 continue
             max_range = max(_num(w.get("range", "")) for w in u.ranged)
-            targets = [e for e in self.enemies_of(u) if u.distance(e) <= max_range]
-            if not targets:
+            # rule: Covering Fire may only target the CLOSEST enemy unit,
+            # and never manifestations or faction terrain
+            candidates = [
+                e for e in self.enemies_of(u)
+                if not e.untargetable_by_covering_fire
+            ]
+            if not candidates:
                 continue
-            target = max(
-                targets,
-                key=lambda e: expected_damage(u.ranged, u.models_alive, e.save),
-            )
+            target = min(candidates, key=u.distance)
+            if u.distance(target) > max_range:
+                continue
             # not worth a CP if the volley barely scratches at -1 to hit
             if expected_damage(u.ranged, u.models_alive, target.save) < 2.0:
                 continue
-            if not self.spend_cp(side):
+            if not self.use_command(side, "Covering Fire", u):
                 return
             atk_mods, atk_details = collect_mods_detailed(u, self.units, "shooting")
             atk_mods["hit"] = min(1, atk_mods.get("hit", 0) + 1)  # -1 to hit
@@ -322,7 +370,7 @@ class BattleSimulator:
             ward = effective_ward(target, def_mods)
             self.emit_command(
                 side, "Covering Fire", u, "SHOOT",
-                f"shoots {target.name} at -1 to hit",
+                f"shoots its closest enemy {target.name} at -1 to hit",
             )
             dmg, warded = unit_attack(u.ranged, u.models_alive, target.save,
                                       self.rng, ward, atk_mods, def_mods)
@@ -333,8 +381,8 @@ class BattleSimulator:
     def reaction_counter_charge(self, side: str):
         """Counter-charge (1 CP): right after the opponent's charge phase,
         a strong melee unit (MONSTER/HERO) within 12" intercepts a charger
-        that reached one of our fragile units."""
-        if self.cp[side] <= 0:
+        that reached one of our fragile units. Costs 2 CP."""
+        if self.cp[side] < 2:
             return
         for ally in self.side_units(side):
             # fragile: weak in melee (wizards, artillery, shooters)
@@ -370,7 +418,7 @@ class BattleSimulator:
                 interceptors,
                 key=lambda x: expected_damage(x.melee, x.models_alive, charger.save),
             )
-            if not self.spend_cp(side):
+            if not self.use_command(side, "Counter-charge", u, cost=2):
                 return
             roll = self.rng.randint(1, 6) + self.rng.randint(1, 6)
             dist = u.distance(charger)
@@ -399,27 +447,149 @@ class BattleSimulator:
 
     # -- phases --------------------------------------------------------
     def hero_phase(self, side: str):
-        """Hero phase: start-of-turn abilities + Rally command."""
+        """Hero phase: start-of-turn abilities, Rally and casting."""
         self.phase_marker(side, "hero")
         apply_turn_mortal_wounds(self, side)
-        # Rally (1 CP): most damaged unit not in combat rolls 6 dice,
-        # each 4+ heals 1 damage (AoS4 rally points, simplified)
+        self._rally(side)
+        self.magic_actions(side)
+
+    def _rally(self, side: str):
+        """Rally (1 CP): a unit not in combat rolls 6 dice (+1 with a
+        MUSICIAN), each 4+ is a rally point. Points heal 1 damage each,
+        or revive a slain model for points equal to its Health."""
         wounded = [
             u for u in self.side_units(side)
-            if u.wounds_taken > 0
-            and not any(u.distance(e) <= COMBAT_RANGE for e in self.enemies_of(u))
+            if u.wounds_taken > 0 and not self._in_combat(u)
         ]
-        if wounded and self.cp[side] > 0:
-            target = max(wounded, key=lambda u: u.wounds_taken)
-            self.spend_cp(side)
-            rally_points = sum(1 for _ in range(6) if self.rng.randint(1, 6) >= 4)
-            healed = min(target.wounds_taken, rally_points)
-            target.wounds_taken -= healed
-            self.emit_command(
-                side, "Rally", target, "HERO",
-                f"rolled {rally_points} rally point(s), heals {healed} damage",
-                healed=healed,
-            )
+        if not wounded or self.cp[side] <= 0:
+            return
+        target = max(wounded, key=lambda u: u.wounds_taken)
+        if not self.use_command(side, "Rally", target):
+            return
+        dice = 6 + (1 if target.has_musician else 0)
+        rally_points = sum(1 for _ in range(dice) if self.rng.randint(1, 6) >= 4)
+        # slain models cost their Health in rally points to return
+        models_lost = target.models - target.models_alive
+        revived = 0
+        while (
+            models_lost - revived > 0
+            and target.health_per_model > 0
+            and rally_points >= target.health_per_model
+        ):
+            rally_points -= target.health_per_model
+            revived += 1
+        revived_damage = revived * target.health_per_model
+        healed = min(target.wounds_taken - revived_damage, rally_points)
+        total_restored = revived_damage + healed
+        target.wounds_taken -= total_restored
+        detail = f"rolled {dice} dice"
+        if target.has_musician:
+            detail += " (incl. MUSICIAN bonus die)"
+        if revived:
+            detail += f", revives {revived} slain model(s)"
+        if healed:
+            detail += f", heals {healed} damage"
+        if not revived and not healed:
+            detail += ", no effect"
+        self.emit_command(
+            side, "Rally", target, "HERO", detail,
+            healed=total_restored, revived=revived,
+        )
+
+    def magic_actions(self, side: str):
+        """Casting in the hero phase. Each WIZARD (X) unit has X actions
+        this phase — the active side spends them casting, the defending
+        side spends them unbinding. Generic spell: Arcane Bolt (casting
+        value 5, range 12", D3 mortal damage).
+
+        Core-rule constraints implemented here:
+        - miscast: a casting roll containing two or more 1s fails
+          immediately, deals D3 mortal damage to the caster and locks
+          them out of casting for the rest of the phase
+        - only ONE unbind attempt may be made per spell, army-wide
+        """
+        casters = [u for u in self.side_units(side) if u.wizard_level > 0]
+        if not casters:
+            return
+        # per-phase action budget for every wizard on the board
+        budget = {u.uid: u.wizard_level for u in self.units if u.wizard_level > 0}
+        CV = 5  # Arcane Bolt casting value
+
+        for caster in casters:
+            while caster.alive and budget.get(caster.uid, 0) > 0:
+                targets = [
+                    e for e in self.enemies_of(caster)
+                    if caster.distance(e) <= 12.0
+                ]
+                if not targets:
+                    break
+                target = min(targets, key=caster.distance)
+                budget[caster.uid] -= 1
+                d1, d2 = self.rng.randint(1, 6), self.rng.randint(1, 6)
+                total = d1 + d2
+
+                if (d1 == 1) + (d2 == 1) >= 2:
+                    # miscast: instant fail, D3 mortal, no more casting
+                    penalty = self.rng.randint(1, 3)
+                    dmg, warded = ward_roll(penalty, caster.ward, self.rng)
+                    if warded:
+                        self.emit_defense(caster, caster.ward, warded, dmg)
+                    caster.wounds_taken += dmg
+                    slain = not caster.alive
+                    self.emit(
+                        type="miscast", category="MAGIC", uid=caster.uid,
+                        dice=[d1, d2], damage=dmg, slain=slain,
+                        text=f"MISCAST! {caster.name} rolls a double 1 — "
+                        f"suffers {dmg} mortal damage and cannot cast again "
+                        f"this phase"
+                        + (f" — {caster.name} is destroyed!" if slain else ""),
+                    )
+                    break  # locked out for the rest of the phase
+
+                if total < CV:
+                    self.emit(
+                        type="cast", category="MAGIC", uid=caster.uid,
+                        target=target.uid, roll=total, needed=CV, success=False,
+                        text=f"{caster.name} fails to cast Arcane Bolt "
+                        f"(rolled {total}, needs {CV}+)",
+                    )
+                    continue
+
+                # unbind window: at most ONE attempt per spell, army-wide
+                unbinders = [
+                    e for e in self.enemies_of(caster)
+                    if e.wizard_level > 0 and budget.get(e.uid, 0) > 0
+                    and caster.distance(e) <= 30.0
+                ]
+                unbound = False
+                if unbinders:
+                    ub = min(unbinders, key=caster.distance)
+                    budget[ub.uid] -= 1
+                    ub_roll = self.rng.randint(1, 6) + self.rng.randint(1, 6)
+                    unbound = ub_roll > total
+                    self.emit(
+                        type="unbind", category="MAGIC", uid=ub.uid,
+                        target=caster.uid, roll=ub_roll, against=total,
+                        success=unbound,
+                        text=f"{ub.name} attempts to unbind "
+                        f"({ub_roll} vs {total}) — "
+                        + ("the spell is unbound!" if unbound else "and fails"),
+                    )
+                self.emit(
+                    type="cast", category="MAGIC", uid=caster.uid,
+                    target=target.uid, roll=total, needed=CV,
+                    success=not unbound,
+                    text=f"{caster.name} casts Arcane Bolt at {target.name} "
+                    f"(rolled {total})" + (" — unbound" if unbound else ""),
+                )
+                if unbound:
+                    continue
+                # D3 mortal damage joins the damage pool, then Ward rolls
+                pool = self.rng.randint(1, 3)
+                ward = effective_ward(target, collect_mods(target, self.units, None))
+                dmg, warded = ward_roll(pool, ward, self.rng)
+                self.apply_damage(caster, target, dmg, "blasts", "spell",
+                                  warded=warded, ward=ward)
 
     def end_phase(self, side: str):
         """End phase: AoS4 has no battleshock — expiring effects resolve
@@ -436,6 +606,30 @@ class BattleSimulator:
         # reaction hook: the inactive player may Redeploy
         self.reaction_redeploy(self._other(side))
 
+    def _retreat(self, u: SimUnit, threat: SimUnit):
+        """Retreat: leave combat, suffering D3 mortal damage before the
+        move (core rules). Ward saves apply to the mortal damage."""
+        penalty = self.rng.randint(1, 3)
+        dmg, warded = ward_roll(penalty, u.ward, self.rng)
+        if warded:
+            self.emit_defense(u, u.ward, warded, dmg)
+        u.wounds_taken += dmg
+        dist = u.distance(threat) or 0.1
+        step = max(0.0, u.move)
+        nx = min(max(u.x + (u.x - threat.x) / dist * step, 0.5), BOARD_W - 0.5)
+        ny = min(max(u.y + (u.y - threat.y) / dist * step, 0.5), BOARD_H - 0.5)
+        slain = not u.alive
+        self.emit(
+            type="retreat", category="MOVE", uid=u.uid, target=threat.uid,
+            damage=dmg, dist=round(step, 1),
+            frm=[round(u.x, 2), round(u.y, 2)], to=[round(nx, 2), round(ny, 2)],
+            text=f"{u.name} retreats from combat, suffering {dmg} mortal damage"
+            + (f" — {u.name} is destroyed!" if slain else ""),
+            slain=slain,
+        )
+        if u.alive:
+            u.x, u.y = nx, ny
+
     def _movement_actions(self, side: str):
         for u in self.side_units(side):
             enemies = self.enemies_of(u)
@@ -444,7 +638,14 @@ class BattleSimulator:
             target = min(enemies, key=u.distance)
             dist = u.distance(target)
             if dist <= COMBAT_RANGE:
-                continue  # already in combat; hold
+                # in combat: shooters retreat (paying D3 mortal damage),
+                # melee units hold their ground
+                shooter = u.ranged and expected_damage(
+                    u.ranged, u.models_alive, "4+"
+                ) > expected_damage(u.melee, u.models_alive, "4+")
+                if shooter:
+                    self._retreat(u, target)
+                continue
             move_mods, move_details = collect_mods_detailed(u, self.units, "movement")
             move_mod = move_mods.get("move", 0)
             if move_mod:
@@ -546,7 +747,7 @@ class BattleSimulator:
                     text=f"{u.name} fails its charge (rolled {charge_roll})",
                 )
                 # Forward to Victory (1 CP): re-roll the failed charge
-                if self.spend_cp(side):
+                if self.use_command(side, "Forward to Victory", u):
                     reroll = self.rng.randint(1, 6) + self.rng.randint(1, 6)
                     self.emit_command(side, "Forward to Victory", u, "CHARGE",
                                       f"re-rolls the charge ({reroll})")
@@ -565,10 +766,21 @@ class BattleSimulator:
 
     def combat_phase(self, side: str):
         self.phase_marker(side, "combat")
-        # both sides fight in the combat phase, active player's units first
-        order = self.side_units(side) + self.side_units(
-            "enemy" if side == "player" else "player"
-        )
+        # both sides fight; STRIKE-FIRST units go first and STRIKE-LAST
+        # last (a unit with both keywords cancels out to normal order),
+        # with the active player's units leading inside each bracket
+        def strike_bracket(u: SimUnit) -> int:
+            first, last = u.strike_first, u.strike_last
+            if first and last:
+                return 1  # keywords cancel out
+            if first:
+                return 0
+            if last:
+                return 2
+            return 1
+
+        base = self.side_units(side) + self.side_units(self._other(side))
+        order = sorted(base, key=strike_bracket)
         for u in order:
             if not u.alive or not u.melee:
                 continue
@@ -637,9 +849,10 @@ class BattleSimulator:
         self, attacker: SimUnit, target: SimUnit, dmg: int, verb: str, kind: str,
         warded: int = 0, ward: str = "", applied_details: list | None = None,
     ):
-        category = {"shoot": "SHOOT", "melee": "COMBAT", "mortal": "HERO"}.get(
-            kind, "COMBAT"
-        )
+        category = {
+            "shoot": "SHOOT", "melee": "COMBAT", "mortal": "HERO",
+            "spell": "MAGIC",
+        }.get(kind, "COMBAT")
         applied, suffix = self._attack_effect_brief(applied_details or [])
         if warded > 0:
             self.emit_defense(target, ward, warded, dmg)
@@ -670,9 +883,18 @@ class BattleSimulator:
             first = "player" if self.rng.random() < 0.5 else "enemy"
             second = "enemy" if first == "player" else "player"
             self.cp = {"player": 4, "enemy": 4}  # AoS4: 4 CP per round
+            # the underdog (fewer surviving points) gains 1 extra CP
+            p_pts = sum(u.points for u in self.side_units("player"))
+            e_pts = sum(u.points for u in self.side_units("enemy"))
+            underdog = ""
+            if p_pts != e_pts:
+                underdog = "player" if p_pts < e_pts else "enemy"
+                self.cp[underdog] += 1
             self.emit(type="round", category="PHASE", round_no=rnd, first=first,
+                      underdog=underdog,
                       text=f"Battle round {rnd} begins — {first} goes first "
-                      f"(both sides gain 4 CP)")
+                      f"(both sides gain 4 CP"
+                      + (f"; underdog {underdog} gains 1 extra CP)" if underdog else ")"))
             for side in (first, second):
                 if not self.side_units("player") or not self.side_units("enemy"):
                     break
@@ -684,6 +906,13 @@ class BattleSimulator:
                 self.combat_phase(side)
                 self.end_phase(side)
                 self.emit(type="state", units=self.snapshot())
+            lost = {s: self.cp[s] for s in ("player", "enemy")}
+            self.cp = {"player": 0, "enemy": 0}  # unspent CP is lost
+            self.emit(
+                type="cp_reset", category="PHASE", round_no=rnd,
+                text=f"Battle round {rnd} ends — unspent CP discarded "
+                f"(player {lost['player']}, enemy {lost['enemy']})",
+            )
             if not self.side_units("player") or not self.side_units("enemy"):
                 break
 

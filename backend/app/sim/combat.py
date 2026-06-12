@@ -106,38 +106,31 @@ def resolve_damage(
     weapon: dict,
     save_stat: str,
     rng: random.Random,
-    ward_stat: str = "",
     atk_mods: dict | None = None,
     def_mods: dict | None = None,
-) -> tuple[int, int]:
-    """Apply save rolls (modified by Rend), roll damage, then ward rolls.
+) -> int:
+    """Apply save rolls (modified by Rend) and roll damage.
 
-    Returns ``(damage, warded)`` — the final damage dealt plus how many
-    damage points the defender's Ward save negated, so the engine can
-    log the defensive gimmick explicitly.
+    Returns the damage added to the damage pool — Ward saves are NOT
+    rolled here. Per the AoS4 damage sequence the whole attack's damage
+    accumulates into a pool first, then the target rolls a Ward die per
+    damage point (see ``unit_attack`` / ``ward_roll``).
 
     ``atk_mods`` may add 'rend'/'damage'; ``def_mods`` may shift 'save'
     (negative improves the save, same convention as roll targets)."""
     atk_mods = atk_mods or {}
     def_mods = def_mods or {}
     save_t = target_number(save_stat)
-    ward_t = target_number(ward_stat)
     rend = max(0, rend_value(weapon["rend"]) + atk_mods.get("rend", 0))
     dmg_bonus = atk_mods.get("damage", 0)
-    damage = 0
-    warded = 0
+    pool = 0
     for _ in range(wounding_hits):
         if save_t is not None:
             needed = save_t + rend + def_mods.get("save", 0)
             if needed <= 6 and rng.randint(1, 6) >= needed:
                 continue  # saved
-        per_hit = max(1, (roll_value(weapon["damage"], rng) or 1) + dmg_bonus)
-        for _ in range(per_hit):
-            if ward_t is not None and rng.randint(1, 6) >= ward_t:
-                warded += 1  # ward save negates this damage point
-                continue
-            damage += 1
-    return damage, warded
+        pool += max(1, (roll_value(weapon["damage"], rng) or 1) + dmg_bonus)
+    return pool
 
 
 def ward_roll(damage: int, ward_stat: str, rng: random.Random) -> tuple[int, int]:
@@ -164,17 +157,17 @@ def unit_attack(
     def_mods: dict | None = None,
 ) -> tuple[int, int]:
     """Full attack sequence for all of a unit's weapon profiles.
-    Returns ``(damage, warded)`` aggregated over every profile."""
-    total = 0
-    warded_total = 0
+
+    AoS4 damage sequence: every profile's post-save damage accumulates
+    into one damage pool, and only then does the defender roll a Ward
+    die for each point in the pool. Returns ``(damage, warded)``."""
+    pool = 0
     for weapon in attacker_weapons:
         wounds = roll_attacks(weapon, models, rng, atk_mods)
-        dmg, warded = resolve_damage(
-            wounds, weapon, defender_save, rng, defender_ward, atk_mods, def_mods
+        pool += resolve_damage(
+            wounds, weapon, defender_save, rng, atk_mods, def_mods
         )
-        total += dmg
-        warded_total += warded
-    return total, warded_total
+    return ward_roll(pool, defender_ward, rng)
 
 
 def expected_damage(weapons: list[dict], models: int, defender_save: str) -> float:
