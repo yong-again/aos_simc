@@ -197,6 +197,17 @@ export default function App() {
           })
         );
         break;
+      case 'defense':
+        setUnits((current) => {
+          const target = current.find((u) => u.uid === ev.uid);
+          if (target) {
+            pushEffects([
+              { kind: 'ward', at: { x: target.x, y: target.y }, ttl: 700 },
+            ]);
+          }
+          return current;
+        });
+        break;
       case 'end':
         setPhaseLabel(t('battleOver'));
         break;
@@ -204,7 +215,11 @@ export default function App() {
         break;
     }
     const line = formatEvent(ev, unitNames, lang);
-    if (line) setFeed((f) => [...f.slice(-60), `[R${ev.round}] ${line}`]);
+    if (line) {
+      const cat = ev.category || 'SYSTEM';
+      const text = cat === 'PHASE' ? line : `[R${ev.round}] ${line}`;
+      setFeed((f) => [...f.slice(-60), { cat, text }]);
+    }
 
     // visual effects for attacks
     if (ev.type === 'attack') {
@@ -415,8 +430,10 @@ export default function App() {
             />
             {stage === 'battle' && (
               <div className="feed">
-                {feed.slice(-8).map((line, i) => (
-                  <div key={i}>{line}</div>
+                {feed.slice(-8).map((entry, i) => (
+                  <div key={i} className={`log-line log-${entry.cat}`}>
+                    {entry.text}
+                  </div>
                 ))}
               </div>
             )}
@@ -455,12 +472,13 @@ export default function App() {
             ))}
           </div>
           <div className="panel-title">{t('battleLog')}</div>
-          <pre className="battle-log">
-            {(lang === 'ko'
-              ? buildLog(result.events, unitNames, 'ko')
-              : result.log
-            ).join('\n')}
-          </pre>
+          <div className="battle-log">
+            {buildLog(result.events, unitNames, lang).map((e, i) => (
+              <div key={i} className={`log-line log-${e.category}`}>
+                {e.category === 'PHASE' ? e.text : `[R${e.round}] ${e.text}`}
+              </div>
+            ))}
+          </div>
         </div>
       )}
     </div>
