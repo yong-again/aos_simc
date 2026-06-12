@@ -38,10 +38,29 @@ Extract the roster into the requested JSON schema:
 - is_general is true for the hero marked as General.
 - is_reinforced is true when a unit is marked Reinforced (or has doubled
   unit size / points).
-- options collects enhancements, artefacts, heroic traits, spells, marks
-  and wargear choices listed under the hero/unit.
+- options: copy EVERY bullet line ("•", "-", "*") listed under a hero or
+  unit, verbatim minus the bullet character. This includes weapon/wargear
+  choices with counts (e.g. "2x Privateer Heavy Weapon", "1x Skypike"),
+  champion/standard bearer/musician upgrades, "A or B" choices, and
+  enhancements/artefacts/heroic traits/spells with their point costs.
+  Only two bullet lines are NOT options: the "General" marker (sets
+  is_general) and the "Reinforced" marker (sets is_reinforced) — all
+  OTHER bullets of that same unit still go into options.
+  A unit with no bullet lines has options: [].
+
+  Example input:
+    Skywardens (260)
+    • Reinforced
+    • 2x Aethermatic Volley Gun and Gun Butt
+    • 2x Skyrigger Heavy Weapon and Gun Butt
+  Example output for that unit:
+    {{"name": "Skywardens", "points": 260, "is_reinforced": true,
+      "options": ["2x Aethermatic Volley Gun and Gun Butt",
+                  "2x Skyrigger Heavy Weapon and Gun Butt"]}}
 - faction_terrain is the faction terrain feature name, or "" if absent.
 - total_points is the army total; if absent, sum the unit points.
+- Ignore army-builder footers (e.g. "Created with ...", "Data Version"),
+  battle tactic cards and manifestation lore lines.
 
 Roster text:
 ---
